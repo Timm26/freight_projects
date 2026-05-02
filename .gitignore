@@ -3,6 +3,7 @@
 *.txt
 *.TXT
 !requirements.txt
+!packages.txt
 *.pdf
 *.xlsx
 *.pyc
