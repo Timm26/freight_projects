@@ -4,6 +4,7 @@
 *.pdf
 *.xlsx
 invoices/
+rohlig_split/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
