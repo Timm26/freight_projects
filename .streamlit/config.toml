@@ -1,2 +1,11 @@
 [server]
 maxUploadSize = 20
+
+[client]
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
