@@ -14,15 +14,6 @@ st.set_page_config(
     layout="wide"
 )
 
-hide_menu = """
-<style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-</style>
-"""
-st.markdown(hide_menu, unsafe_allow_html=True)
-
 st.title("🚛 Rohlig RCTI Processor")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -336,7 +327,57 @@ with tab2:
             })
 
         df_compare = pd.DataFrame(comparison_rows)
-        st.dataframe(df_compare, use_container_width=True, hide_index=True)
+
+        # Column pairs for value comparison (TXT col, CSV col)
+        compare_pairs = [
+            ('TXT Load Qty',    'CSV Total Cubic'),
+            ('TXT Paid Qty',    'CSV Quantity'),
+            ('TXT Freight',     'CSV Rate Charge'),
+            ('TXT LEVY',        'CSV Fuel Levy'),
+            ('TXT Total (AUD)', 'CSV Rate+Fuel Levy'),
+            ('TXT GST',         'CSV Total Tax'),
+            ('TXT Final Total', 'CSV Total'),
+        ]
+        csv_to_txt = {csv_col: txt_col for txt_col, csv_col in compare_pairs}
+
+        # TXT = dark blue, CSV = dark teal, green/red on CSV where values differ
+        TXT_BG  = 'background-color: #1a2a45; color: #a8c4e0'
+        CSV_BG  = 'background-color: #1a3a35; color: #a8d4cc'
+        CSV_RED = 'background-color: #a83232; color: white'
+        CSV_GRN = 'background-color: #1a7a1a; color: white'
+
+        def style_comparison(df):
+            styles = pd.DataFrame('', index=df.index, columns=df.columns)
+            for col in df.columns:
+                if col == 'Customer Reference':
+                    continue
+                elif col.startswith('TXT'):
+                    styles[col] = TXT_BG
+                elif col.startswith('CSV'):
+                    txt_col = csv_to_txt.get(col)
+                    if txt_col and txt_col in df.columns:
+                        for i in range(len(df)):
+                            try:
+                                csv_val = float(df[col].iloc[i])
+                                txt_val = float(df[txt_col].iloc[i])
+                                if txt_val > csv_val:
+                                    styles.iloc[i, df.columns.get_loc(col)] = CSV_GRN
+                                elif csv_val > txt_val:
+                                    styles.iloc[i, df.columns.get_loc(col)] = CSV_RED
+                                else:
+                                    styles.iloc[i, df.columns.get_loc(col)] = CSV_BG
+                            except:
+                                styles.iloc[i, df.columns.get_loc(col)] = CSV_BG
+                    else:
+                        styles[col] = CSV_BG
+            return styles
+
+        st.caption("🔵 TXT columns (dark blue)  |  🟩 CSV columns (teal = match, green = higher, red = lower)")
+        st.dataframe(
+            df_compare.style.apply(style_comparison, axis=None),
+            use_container_width=True,
+            hide_index=True
+        )
 
         # ── Section 3: Discrepancy table ──────────────────────────────────
 
@@ -374,22 +415,27 @@ with tab2:
             def highlight_diffs(df):
                 styles = pd.DataFrame('', index=df.index, columns=df.columns)
                 for col in df.columns:
-                    if col.startswith('Diff '):
+                    if col == 'Customer Reference':
+                        continue
+                    elif col.startswith('TXT '):
+                        styles[col] = 'background-color: #1a2a45; color: #a8c4e0'
+                    elif col.startswith('CSV '):
+                        styles[col] = 'background-color: #1a3a35; color: #a8d4cc'
+                    elif col.startswith('Diff '):
                         for i, val in enumerate(df[col]):
                             if pd.notna(val) and val != '':
                                 try:
-                                    if float(val) > 0:
-                                        # CSV higher than TXT — green
+                                    if float(val) < 0:
                                         styles.iloc[i, df.columns.get_loc(col)] = \
                                             'background-color: #1a7a1a; color: white'
-                                    elif float(val) < 0:
-                                        # CSV lower than TXT — red
+                                    elif float(val) > 0:
                                         styles.iloc[i, df.columns.get_loc(col)] = \
                                             'background-color: #a83232; color: white'
                                 except:
                                     pass
                 return styles
 
+            st.caption("🔵 TXT columns  |  🟩 CSV columns  |  🟢 Diff positive (CSV higher)  |  🔴 Diff negative (CSV lower)")
             st.dataframe(
                 df_disc.style.apply(highlight_diffs, axis=None),
                 use_container_width=True,
