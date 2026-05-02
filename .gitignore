@@ -1,6 +1,7 @@
 # Files to not upload
 *.csv
 *.txt
+!requirements.txt
 *.pdf
 *.xlsx
 *.pyc
