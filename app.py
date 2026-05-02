@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
+import base64
+import json
+import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 import io
 import re
-import datetime
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -16,15 +18,6 @@ st.set_page_config(
 )
 
 st.title("🚛 Rohlig RCTI Processor")
-
-hide_menu = """
-<style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-</style>
-"""
-st.markdown(hide_menu, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -154,7 +147,7 @@ def build_excel(df, client_total):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation"])
+tab1, tab2, tab3 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation", "📸 Screenshot to Excel"])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — RCTI Processor
@@ -502,10 +495,10 @@ with tab2:
                 hide_index=True
             )
 
-        # ── Download Excel ─────────────────────────────────
+        # ── Download reconciliation Excel ─────────────────────────────────
 
         st.divider()
-        st.subheader("⬇️ Download Report")
+        st.subheader("⬇️ Download Reconciliation Report")
 
         def build_recon_tables(df_txt_in, df_csv_in, df_matched_txt_in, df_matched_csv_in):
             """Build comparison and discrepancy dataframes for a given filtered dataset."""
@@ -648,11 +641,184 @@ with tab2:
 
         recon_buffer = build_recon_excel(df_txt, df_csv, df_matched_txt, df_matched_csv)
         vendor       = df_txt['Vendor'].iloc[0]
-        todays_date = datetime.datetime.today()
 
         st.download_button(
-            label="⬇️ Download Excel",
+            label="⬇️ Download Reconciliation Report (.xlsx)",
             data=recon_buffer,
-            file_name=f'Rohlig_{vendor}_{todays_date}.xlsx',
+            file_name=f'Rohlig_{vendor}_reconciliation.xlsx',
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — Screenshot to Excel
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab3:
+    st.write("Upload one or more screenshots of your charge table. The AI will extract the data and build a downloadable Excel file.")
+
+    screenshots = st.file_uploader(
+        "Upload screenshots (.png, .jpg)",
+        type=['png', 'jpg', 'jpeg'],
+        accept_multiple_files=True,
+        key="tab3_screenshots"
+    )
+
+    COLUMNS = [
+        'Charge', 'Description', 'Bran', 'Depa', 'Cost',
+        'OS Cost Amt', 'Estimated Cost', 'Local Cost Amt', 'Creditor',
+        'Cost Recognition', 'Posted', 'Apt', 'Sell', 'OS Sell Amt',
+        'Estimated Revenue', 'Local Sell Amt', 'Debtor',
+        'Sell Recognition', 'Posted (Sell)'
+    ]
+
+    def extract_table_from_image(image_bytes, media_type):
+        """Send image to Anthropic API and extract table rows as JSON."""
+        b64 = base64.standard_b64encode(image_bytes).decode('utf-8')
+
+        prompt = f"""This is a screenshot of a financial charge table.
+Extract every data row as a JSON array of objects.
+Use exactly these column names: {json.dumps(COLUMNS)}
+- Include every visible row, skip the header row.
+- Use null for any cell that is blank or not visible.
+- Return ONLY the JSON array, no markdown, no explanation.
+Example format: [{{"Charge":"WDEL","Description":"Delivery Charge",...}}]"""
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 4096,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+            }
+        )
+
+        result = response.json()
+        raw = result['content'][0]['text'].strip()
+        # Strip markdown fences if present
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        return json.loads(raw.strip())
+
+    if screenshots:
+        if st.button("🔍 Extract Table Data", key="tab3_extract"):
+            all_rows = []
+            progress = st.progress(0)
+            status   = st.empty()
+
+            for i, img_file in enumerate(screenshots):
+                status.text(f"Processing {img_file.name} ({i+1}/{len(screenshots)})...")
+                img_bytes  = img_file.read()
+                media_type = "image/png" if img_file.name.lower().endswith(".png") else "image/jpeg"
+
+                try:
+                    rows = extract_table_from_image(img_bytes, media_type)
+                    for row in rows:
+                        row['_source'] = img_file.name
+                    all_rows.extend(rows)
+                except Exception as e:
+                    st.warning(f"⚠ Could not extract from {img_file.name}: {e}")
+
+                progress.progress((i + 1) / len(screenshots))
+
+            status.empty()
+            progress.empty()
+
+            if all_rows:
+                df_shots = pd.DataFrame(all_rows)
+
+                # Ensure all expected columns exist
+                for col in COLUMNS:
+                    if col not in df_shots.columns:
+                        df_shots[col] = None
+
+                # Clean numeric columns
+                for col in ['OS Cost Amt', 'Estimated Cost', 'Local Cost Amt',
+                            'OS Sell Amt', 'Estimated Revenue', 'Local Sell Amt']:
+                    df_shots[col] = pd.to_numeric(df_shots[col], errors='coerce')
+
+                st.session_state['screenshot_df'] = df_shots
+                st.success(f"✓ Extracted {len(df_shots)} rows from {len(screenshots)} screenshot(s)")
+
+    # Show results if we have data
+    if 'screenshot_df' in st.session_state:
+        df_shots = st.session_state['screenshot_df']
+
+        st.divider()
+        st.subheader("Extracted Data")
+        display_cols = [c for c in COLUMNS if c in df_shots.columns]
+        st.dataframe(df_shots[display_cols], use_container_width=True, hide_index=True)
+
+        # ── Summary 1: OS Cost Amt by Creditor ───────────────────────────
+        st.divider()
+        st.subheader("OS Cost Amt by Creditor")
+        if 'Creditor' in df_shots.columns and 'OS Cost Amt' in df_shots.columns:
+            cost_summary = (
+                df_shots.groupby('Creditor')['OS Cost Amt']
+                .sum().reset_index()
+                .rename(columns={'OS Cost Amt': 'Total OS Cost Amt'})
+                .sort_values('Total OS Cost Amt', ascending=False)
+            )
+            cost_summary['Total OS Cost Amt'] = cost_summary['Total OS Cost Amt'].round(2)
+            st.dataframe(cost_summary, use_container_width=True, hide_index=True)
+
+        # ── Summary 2: Estimated Revenue by Debtor ───────────────────────
+        st.divider()
+        st.subheader("Estimated Revenue by Debtor")
+        if 'Debtor' in df_shots.columns and 'Estimated Revenue' in df_shots.columns:
+            rev_summary = (
+                df_shots.groupby('Debtor')['Estimated Revenue']
+                .sum().reset_index()
+                .rename(columns={'Estimated Revenue': 'Total Estimated Revenue'})
+                .sort_values('Total Estimated Revenue', ascending=False)
+            )
+            rev_summary['Total Estimated Revenue'] = rev_summary['Total Estimated Revenue'].round(2)
+            st.dataframe(rev_summary, use_container_width=True, hide_index=True)
+
+        # ── Download ──────────────────────────────────────────────────────
+        st.divider()
+
+        def build_screenshot_excel(df, cost_sum, rev_sum):
+            wb  = Workbook()
+            wb.remove(wb.active)
+
+            def write_df_to_sheet(ws, df_in, title):
+                ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=13)
+                for c, col in enumerate(df_in.columns, 1):
+                    cell = ws.cell(row=2, column=c, value=col)
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    cell.fill = PatternFill('solid', start_color='1F4E79')
+                for r, (_, row) in enumerate(df_in.iterrows(), 3):
+                    for c, val in enumerate(row, 1):
+                        ws.cell(row=r, column=c, value=val)
+
+            # Sheet 1 — full data
+            ws1 = wb.create_sheet("Extracted Data")
+            write_df_to_sheet(ws1, df[display_cols], "Extracted Charge Data")
+
+            # Sheet 2 — OS Cost by Creditor
+            ws2 = wb.create_sheet("Cost by Creditor")
+            write_df_to_sheet(ws2, cost_sum, "OS Cost Amt by Creditor")
+
+            # Sheet 3 — Revenue by Debtor
+            ws3 = wb.create_sheet("Revenue by Debtor")
+            write_df_to_sheet(ws3, rev_sum, "Estimated Revenue by Debtor")
+
+            buf = io.BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+            return buf
+
+        excel_buf = build_screenshot_excel(df_shots, cost_summary, rev_summary)
+        st.download_button(
+            label="⬇️ Download Excel",
+            data=excel_buf,
+            file_name="screenshot_charges.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
