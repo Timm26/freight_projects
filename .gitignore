@@ -3,6 +3,9 @@
 *.txt
 *.pdf
 *.xlsx
+*.pyc
+Rohlig_split.xlsx
+*.TXT
 invoices/
 rohlig_split/
 
