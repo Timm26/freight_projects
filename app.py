@@ -5,6 +5,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 import io
 import re
+import datetime
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -272,12 +273,42 @@ with tab2:
             df_matched_txt = df_txt[df_txt['Reconciliation Status'] == '✓ Matched'].copy()
             df_matched_csv = df_csv[df_csv['Reconciliation Status'] == '✓ Matched'].copy()
 
+        # ── State filter ──────────────────────────────────────────────────
+
+        st.divider()
+        available_states = sorted(df_txt['State'].dropna().unique().tolist())
+        state_options    = ['All'] + available_states
+        selected_state   = st.selectbox(
+            "Filter by State",
+            options=state_options,
+            index=0,
+            key="tab2_state_filter"
+        )
+
+        # Apply filter to TXT data — CSV has no state so we filter via matched deliveries
+        if selected_state == 'All':
+            df_txt_filtered     = df_txt.copy()
+            df_matched_txt_f    = df_matched_txt.copy()
+        else:
+            df_txt_filtered     = df_txt[df_txt['State'] == selected_state].copy()
+            filtered_deliveries = set(df_txt_filtered['Delivery/Adjustment'].dropna().str.strip())
+            df_matched_txt_f    = df_matched_txt[
+                df_matched_txt['Delivery/Adjustment'].isin(filtered_deliveries)
+            ].copy()
+
+            # Filter matched CSV to only rows where at least one ref is in filtered deliveries
+            def csv_in_filter(ref_str):
+                return any(r in filtered_deliveries for r in split_customer_refs(str(ref_str)))
+            df_matched_csv      = df_matched_csv[
+                df_matched_csv['Customer Reference'].apply(csv_in_filter)
+            ].copy()
+
         # ── Section 1: Line item check ────────────────────────────────────
 
         st.divider()
         st.subheader("① Line Item Check")
 
-        unmatched_txt = df_txt[df_txt['Reconciliation Status'] != '✓ Matched']
+        unmatched_txt = df_txt_filtered[df_txt_filtered['Reconciliation Status'] != '✓ Matched']
         unmatched_csv = df_csv[df_csv['Reconciliation Status'] != '✓ Matched']
 
         if unmatched_txt.empty and unmatched_csv.empty:
@@ -306,7 +337,7 @@ with tab2:
         comparison_rows = []
         for _, csv_row in df_matched_csv.iterrows():
             refs        = split_customer_refs(csv_row['Customer Reference'])
-            matched_txt = df_matched_txt[df_matched_txt['Delivery/Adjustment'].isin(refs)]
+            matched_txt = df_matched_txt_f[df_matched_txt_f['Delivery/Adjustment'].isin(refs)]
 
             comparison_rows.append({
                 'Customer Reference':   csv_row['Customer Reference'],
@@ -371,6 +402,26 @@ with tab2:
                     else:
                         styles[col] = CSV_BG
             return styles
+
+        # Match stats
+        total_txt     = len(df_matched_txt_f)
+        total_csv     = len(df_matched_csv)
+        exact_matches = sum(
+            1 for _, row in df_compare.iterrows()
+            if all(
+                float(row[csv_col]) == float(row[txt_col])
+                for txt_col, csv_col in [
+                    ('TXT Freight', 'CSV Rate Charge'),
+                    ('TXT LEVY', 'CSV Fuel Levy'),
+                    ('TXT Final Total', 'CSV Total')
+                ]
+            )
+        )
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("TXT Lines Matched", total_txt)
+        col2.metric("CSV Lines Matched", total_csv)
+        col3.metric("Exact Value Matches", f"{exact_matches} / {total_csv}")
 
         st.caption("🔵 TXT columns (dark blue)  |  🟩 CSV columns (teal = match, green = higher, red = lower)")
         st.dataframe(
@@ -441,3 +492,158 @@ with tab2:
                 use_container_width=True,
                 hide_index=True
             )
+
+        # ── Download Excel ─────────────────────────────────
+
+        st.divider()
+        st.subheader("⬇️ Download Report")
+
+        def build_recon_tables(df_txt_in, df_csv_in, df_matched_txt_in, df_matched_csv_in):
+            """Build comparison and discrepancy dataframes for a given filtered dataset."""
+            unmatched_t = df_txt_in[df_txt_in['Reconciliation Status'] != '✓ Matched'][[
+                'Delivery/Adjustment', 'State', 'Origin', 'Total (AUD)', 'GST (AUD)', 'Reconciliation Status'
+            ]].copy()
+
+            unmatched_c = df_csv_in[df_csv_in['Reconciliation Status'] != '✓ Matched'][[
+                'Customer Reference', 'Total', 'Reconciliation Status'
+            ]].copy()
+
+            comp_rows = []
+            for _, csv_row in df_matched_csv_in.iterrows():
+                refs        = split_customer_refs(csv_row['Customer Reference'])
+                mtxt        = df_matched_txt_in[df_matched_txt_in['Delivery/Adjustment'].isin(refs)]
+                comp_rows.append({
+                    'Customer Reference':   csv_row['Customer Reference'],
+                    'TXT Load Qty':         round(mtxt['Load Qty'].sum(), 3),
+                    'CSV Total Cubic':      csv_row['Total Cubic'],
+                    'TXT Paid Qty':         round(mtxt['Paid Qty'].sum(), 3),
+                    'CSV Quantity':         csv_row['Quantity'],
+                    'TXT Freight':          round(mtxt['Freight'].sum(), 2),
+                    'CSV Rate Charge':      csv_row['Rate Charge'],
+                    'TXT LEVY':             round(mtxt['LEVY'].sum(), 2),
+                    'CSV Fuel Levy':        csv_row['Fuel Levy'],
+                    'TXT Total (AUD)':      round(mtxt['Total (AUD)'].sum(), 2),
+                    'CSV Rate+Fuel Levy':   csv_row['Rate Charge and Fuel Levy'],
+                    'TXT GST':              round(mtxt['GST (AUD)'].sum(), 2),
+                    'CSV Total Tax':        csv_row['Total Tax'],
+                    'TXT Final Total':      round(mtxt['Final Total'].sum(), 2),
+                    'CSV Total':            csv_row['Total'],
+                })
+            df_comp = pd.DataFrame(comp_rows) if comp_rows else pd.DataFrame()
+
+            disc_pairs = [
+                ('TXT Freight',     'CSV Rate Charge',  'Rate Charge'),
+                ('TXT LEVY',        'CSV Fuel Levy',     'Fuel Levy'),
+                ('TXT GST',         'CSV Total Tax',     'Total Tax'),
+                ('TXT Final Total', 'CSV Total',         'Total'),
+            ]
+            disc_rows = []
+            for _, row in df_comp.iterrows():
+                diffs = {}
+                for tc, cc, label in disc_pairs:
+                    diff = round(float(row[cc]) - float(row[tc]), 2)
+                    if diff != 0:
+                        diffs[f'TXT {label}'] = row[tc]
+                        diffs[f'CSV {label}'] = row[cc]
+                        diffs[f'Diff {label}'] = diff
+                if diffs:
+                    disc_rows.append({'Customer Reference': row['Customer Reference'], **diffs})
+            df_disc_out = pd.DataFrame(disc_rows) if disc_rows else pd.DataFrame()
+
+            return unmatched_t, unmatched_c, df_comp, df_disc_out
+
+        def write_recon_sheet(ws, sheet_label, unmatched_t, unmatched_c, df_comp, df_disc_out):
+            """Write all three tables to a single worksheet with headers."""
+            from openpyxl.styles import Font, PatternFill, Alignment
+
+            HDR_BLUE = 'FF1a2a45'
+            HDR_TEAL = 'FF1a3a35'
+            HDR_GREY = 'FF2a2a3a'
+            RED_BG   = 'FFa83232'
+            GRN_BG   = 'FF1a7a1a'
+
+            def write_section(ws, title, df, start_row, col_colors=None):
+                # Section title
+                ws.cell(row=start_row, column=1, value=title).font = Font(bold=True, size=12)
+                start_row += 1
+
+                if df is None or df.empty:
+                    ws.cell(row=start_row, column=1, value='No data').font = Font(italic=True)
+                    return start_row + 2
+
+                # Headers
+                for c, col in enumerate(df.columns, 1):
+                    cell = ws.cell(row=start_row, column=c, value=col)
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    bg = HDR_GREY
+                    if col_colors:
+                        if col.startswith('TXT'):  bg = HDR_BLUE
+                        elif col.startswith('CSV'): bg = HDR_TEAL
+                    cell.fill = PatternFill('solid', start_color=bg)
+                start_row += 1
+
+                # Data
+                for _, row in df.iterrows():
+                    for c, col in enumerate(df.columns, 1):
+                        cell = ws.cell(row=start_row, column=c, value=row[col])
+                        if col_colors and col.startswith('Diff '):
+                            try:
+                                v = float(row[col])
+                                if v < 0:
+                                    cell.fill = PatternFill('solid', start_color=GRN_BG)
+                                    cell.font = Font(color='FFFFFF')
+                                elif v > 0:
+                                    cell.fill = PatternFill('solid', start_color=RED_BG)
+                                    cell.font = Font(color='FFFFFF')
+                            except:
+                                pass
+                    start_row += 1
+
+                return start_row + 2  # gap between sections
+
+            row = 1
+            ws.cell(row=row, column=1, value=f'Reconciliation Report — {sheet_label}').font = Font(bold=True, size=14)
+            row += 2
+
+            row = write_section(ws, '① Line Item Check — TXT not in Rohlig Invoice', unmatched_t, row)
+            row = write_section(ws, '① Line Item Check — CSV not in Client Statement', unmatched_c, row)
+            row = write_section(ws, '② Comparison Table', df_comp, row, col_colors=True)
+            row = write_section(ws, '③ Discrepancies', df_disc_out, row, col_colors=True)
+
+        def build_recon_excel(df_txt_full, df_csv_full, df_matched_txt_full, df_matched_csv_full):
+            wb  = Workbook()
+            wb.remove(wb.active)
+            states = sorted(df_txt_full['State'].dropna().unique().tolist())
+            sheets = [('All', None)] + [(s, s) for s in states]
+
+            for sheet_label, state_filter in sheets:
+                if state_filter is None:
+                    t, m_t = df_txt_full, df_matched_txt_full
+                    m_c    = df_matched_csv_full
+                else:
+                    t      = df_txt_full[df_txt_full['State'] == state_filter].copy()
+                    f_dels = set(t['Delivery/Adjustment'].dropna().str.strip())
+                    m_t    = df_matched_txt_full[df_matched_txt_full['Delivery/Adjustment'].isin(f_dels)].copy()
+                    def in_filter(ref_str):
+                        return any(r in f_dels for r in split_customer_refs(str(ref_str)))
+                    m_c    = df_matched_csv_full[df_matched_csv_full['Customer Reference'].apply(in_filter)].copy()
+
+                ut, uc, dc, dd = build_recon_tables(t, df_csv_full, m_t, m_c)
+                ws = wb.create_sheet(title=f'Recon - {sheet_label}')
+                write_recon_sheet(ws, sheet_label, ut, uc, dc, dd)
+
+            buf = io.BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+            return buf
+
+        recon_buffer = build_recon_excel(df_txt, df_csv, df_matched_txt, df_matched_csv)
+        vendor       = df_txt['Vendor'].iloc[0]
+        todays_date = datetime.datetime.today()
+
+        st.download_button(
+            label="⬇️ Download Excel",
+            data=recon_buffer,
+            file_name=f'Rohlig_{vendor}_{todays_date}.xlsx',
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
