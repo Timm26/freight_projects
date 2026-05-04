@@ -131,7 +131,7 @@ def build_excel(df, client_total):
         ws_sum.cell(row=grand_row, column=col,
                     value=f'=SUM({get_column_letter(col)}2:{get_column_letter(col)}{grand_row-1})'
                     ).font = Font(bold=True)
-    ws_sum.cell(row=grand_row+2, column=1, value='Client Total (inc GST)').font = Font(bold=True)
+    ws_sum.cell(row=grand_row+2, column=1, value='Statements Total (inc GST)').font = Font(bold=True)
     ws_sum.cell(row=grand_row+2, column=2, value=client_total)
     ws_sum.cell(row=grand_row+3, column=1, value='Check').font = Font(bold=True)
     ws_sum.cell(row=grand_row+3, column=2,
@@ -165,7 +165,7 @@ with tab1:
             match            = round(our_inc_gst, 2) == round(client_total, 2)
             buffer           = build_excel(df, client_total)
             vendor           = df['Vendor'].iloc[0]
-            filename         = f'Rohlig_{vendor}_split.xlsx'
+            filename         = f'{vendor}_split.xlsx'
 
         st.divider()
         col1, col2, col3 = st.columns(3)
@@ -181,10 +181,10 @@ with tab1:
         col3.metric("Total (inc GST)", f"${our_inc_gst:,.2f}")
 
         if match:
-            st.success(f"✓ MATCH — Our total matches client total of ${client_total:,.2f}")
+            st.success(f"✓ MATCH — Our total matches statement's total of ${client_total:,.2f}")
         else:
             diff = abs(our_inc_gst - client_total)
-            st.error(f"⚠ DISCREPANCY — Difference of ${diff:,.2f} vs client total of ${client_total:,.2f}")
+            st.error(f"⚠ DISCREPANCY — Difference of ${diff:,.2f} vs statement's total of ${client_total:,.2f}")
 
         st.divider()
         st.subheader("Breakdown by Truck & State")
@@ -213,11 +213,11 @@ with tab1:
 # ════════════════════════════════════════════════════════════════════════════
 
 with tab2:
-    st.write("Upload both files to reconcile client charges (.TXT) against invoice (.CSV).")
+    st.write("Upload both files to reconcile charges (.TXT) against invoice (.CSV).")
 
     col1, col2 = st.columns(2)
     with col1:
-        recon_txt = st.file_uploader("Client charges (.TXT)", type=['txt', 'TXT'], key="tab2_txt")
+        recon_txt = st.file_uploader("Statement (.TXT)", type=['txt', 'TXT'], key="tab2_txt")
     with col2:
         recon_csvs = st.file_uploader(
             "invoice(s) (.CSV) — select multiple if needed",
@@ -283,10 +283,10 @@ with tab2:
             st.success("✓ All invoice lines found")
         else:
             if not unmatched_txt.empty:
-                st.warning(f"⚠ {len(unmatched_txt)} TXT line(s) not found in Rohlig invoice")
+                st.warning(f"⚠ {len(unmatched_txt)} TXT line(s) not found in .CSV invoice")
                 st.dataframe(unmatched_txt[['Delivery/Adjustment','State','Origin','Total (AUD)','GST (AUD)','Reconciliation Status']], use_container_width=True, hide_index=True)
             if not unmatched_csv.empty:
-                st.warning(f"⚠ {len(unmatched_csv)} CSV line(s) not found in client statement")
+                st.warning(f"⚠ {len(unmatched_csv)} CSV line(s) not found in .TXT statement")
                 st.dataframe(unmatched_csv[['Customer Reference','Total','Reconciliation Status']], use_container_width=True, hide_index=True)
 
         # Section 2
@@ -474,8 +474,8 @@ with tab2:
                     row += 1
                 return row + 2
             r = 3
-            r = write_sec(ws, '① TXT not in Rohlig Invoice', ut, r)
-            r = write_sec(ws, '① CSV not in Client Statement', uc, r)
+            r = write_sec(ws, '① TXT not in .CSV Invoice', ut, r)
+            r = write_sec(ws, '① CSV not in .TXT Statement', uc, r)
             r = write_sec(ws, '② Comparison Table', dc, r)
             r = write_sec(ws, '③ Discrepancies', dd, r)
 
@@ -502,7 +502,7 @@ with tab2:
         st.download_button(
             label="⬇️ Download Reconciliation Report (.xlsx)",
             data=recon_buf,
-            file_name=f'Rohlig_reconciliation.xlsx',
+            file_name=f'invoice_reconciliation.xlsx',
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
