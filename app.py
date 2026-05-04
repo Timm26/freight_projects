@@ -9,7 +9,7 @@ import re
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="RCTI Processor",
+    page_title="Data Processing Toolbox",
     page_icon="🚛",
     layout="wide"
 )
@@ -23,7 +23,7 @@ header {visibility: hidden;}
 """
 st.markdown(hide_menu, unsafe_allow_html=True)
 
-st.title("🚛 RCTI Processor")
+st.title("🚛 Data Processing Toolbox")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -143,7 +143,7 @@ def build_excel(df, client_total):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation", "📸 Screenshot to Excel"])
+tab1, tab2, tab3 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation", "📸 Screenshot to Excel (Beta)"])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1
