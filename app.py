@@ -9,7 +9,7 @@ import re
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Rohlig RCTI Processor",
+    page_title="RCTI Processor",
     page_icon="🚛",
     layout="wide"
 )
@@ -23,7 +23,7 @@ header {visibility: hidden;}
 """
 st.markdown(hide_menu, unsafe_allow_html=True)
 
-st.title("🚛 Rohlig RCTI Processor")
+st.title("🚛 RCTI Processor")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -213,14 +213,14 @@ with tab1:
 # ════════════════════════════════════════════════════════════════════════════
 
 with tab2:
-    st.write("Upload both files to reconcile client charges (.TXT) against Rohlig's invoice (.CSV).")
+    st.write("Upload both files to reconcile client charges (.TXT) against invoice (.CSV).")
 
     col1, col2 = st.columns(2)
     with col1:
         recon_txt = st.file_uploader("Client charges (.TXT)", type=['txt', 'TXT'], key="tab2_txt")
     with col2:
         recon_csvs = st.file_uploader(
-            "Rohlig invoice(s) (.CSV) — select multiple if needed",
+            "invoice(s) (.CSV) — select multiple if needed",
             type=['csv', 'CSV'], key="tab2_csv", accept_multiple_files=True
         )
 
