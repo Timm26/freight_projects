@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 import io
 import re
+from datetime import datetime
+from collections import Counter
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -295,6 +297,253 @@ def build_excel(df, client_total):
     buffer.seek(0)
     return buffer
 
+# ════════════════════════════════════════════════════════════════════════════
+# RATE-CARD RECONCILIATION HELPERS  (Tab 2)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# ONLINE / STREAMLIT-CLOUD BUILD
+# ------------------------------
+# This version stores NOTHING. There is no database. The rate card and all
+# invoice/CSV files must be uploaded every session and live only in memory for
+# the duration of the run. Nothing is written to disk.
+#
+# The only hardcoded values are the Fuel Surcharge (FSC) rates below — these
+# are not confidential, so they are kept in code for convenience. Edit them
+# here whenever the FSC changes.
+
+ZONE_PREFIX_STATE = {
+    'V': 'VIC', 'N': 'NSW', 'S': 'SA', 'Q': 'QLD',
+    'W': 'WA',  'T': 'TAS', 'D': 'NT', 'A': 'ACT'
+}
+
+# ── Fuel Surcharge (FSC) config — the ONLY hardcoded metric ───────────────────
+# CURRENT_FSC_PCT is the default applied to every invoice line whose date is not
+# covered by a date-range override below. Update it when the current week's FSC
+# changes. Date ranges use DD.MM.YYYY.
+
+CURRENT_FSC_PCT = 29.0
+
+FSC_OVERRIDES = [
+    {"from": "01.05.2026", "to": "01.05.2026", "pct": 42.0, "note": "1 May"},
+    {"from": "04.05.2026", "to": "08.05.2026", "pct": 33.0, "note": "4-8 May"},
+    {"from": "11.05.2026", "to": "19.05.2026", "pct": 31.0, "note": "11-19 May"},
+    {"from": "20.05.2026", "to": "31.05.2026", "pct": 29.0, "note": "20-31 May"},
+]
+
+def get_fsc_overrides_df():
+    """Build the FSC override table (in memory) from the hardcoded config."""
+    if not FSC_OVERRIDES:
+        return pd.DataFrame(columns=['date_from', 'date_to', 'fsc_pct', 'note'])
+    return pd.DataFrame([
+        {'date_from': o['from'], 'date_to': o['to'], 'fsc_pct': o['pct'], 'note': o.get('note', '')}
+        for o in FSC_OVERRIDES
+    ])
+
+
+# ── Rate-card parsing ─────────────────────────────────────────────────────────
+
+def parse_rate_card(file_like):
+    """Parse the Rohlig/Sugar transportation rate card → structured dict."""
+    wb = load_workbook(file_like, data_only=True)
+    parsed = {'effective': None, 'zone_bands': {}, 'metro_band': None,
+              'cubic_factor': None, 'basic_charge_kg': None}
+
+    if 'Transportation - Metro,Regional' not in wb.sheetnames:
+        return parsed
+
+    ws = wb['Transportation - Metro,Regional']
+    eff = ws.cell(row=1, column=2).value or ''
+    m = re.search(r'(\d{2}\.\d{2}\.\d{4})', str(eff))
+    parsed['effective'] = m.group(1) if m else None
+
+    cf = ws.cell(row=6, column=4).value
+    if isinstance(cf, (int, float)):
+        parsed['cubic_factor'] = cf
+
+    note = ws.cell(row=3, column=32).value or ''
+    bc = re.search(r'\$?\s*([\d.]+)', str(note))
+    if bc:
+        try: parsed['basic_charge_kg'] = float(bc.group(1))
+        except: pass
+
+    # Regional pallet block: cols J-R (10-18); zone=col 13, bands=cols 15-18
+    zone_bands = {}
+    for r in range(14, ws.max_row + 1):
+        zone = ws.cell(row=r, column=13).value
+        p1, p25, p611, p12 = (ws.cell(row=r, column=col).value for col in (15, 16, 17, 18))
+        if zone and isinstance(p1, (int, float)):
+            zone_bands.setdefault(str(zone).strip(), [p1, p25, p611, p12])
+    parsed['zone_bands'] = zone_bands
+
+    if zone_bands:
+        band_counts = Counter(tuple(v) for v in zone_bands.values())
+        parsed['metro_band'] = list(band_counts.most_common(1)[0][0])
+
+    return parsed
+
+# ── Reconciliation logic ────────────────────────────────────────────────────
+
+def _origin_state(origin_text, zone):
+    for s in STATES:
+        if s in str(origin_text):
+            return s
+    z = str(zone)
+    if len(z) >= 2:
+        return ZONE_PREFIX_STATE.get(z[1].upper(), 'UNKNOWN')
+    return 'UNKNOWN'
+
+def _dest_state(zone):
+    z = str(zone)
+    if len(z) >= 2:
+        return ZONE_PREFIX_STATE.get(z[1].upper(), 'UNKNOWN')
+    return 'UNKNOWN'
+
+def _band_rate(qty, band):
+    q = round(qty)
+    if q <= 1:  return band[0]
+    if q <= 5:  return band[1]
+    if q <= 11: return band[2]
+    return band[3]
+
+def _parse_date(d):
+    """TXT dates are DD.MM.YYYY."""
+    for fmt in ('%d.%m.%Y', '%d/%m/%Y', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(str(d).strip(), fmt).date()
+        except: pass
+    return None
+
+def fsc_for_date(date_obj, fsc_df, default_fsc=None):
+    """
+    Return (fsc_fraction, source) for a given date.
+    Date-range entries take priority; otherwise fall back to the current default FSC.
+    default_fsc is a percentage (e.g. 31.0) or None.
+    """
+    if date_obj is not None and not fsc_df.empty:
+        for _, r in fsc_df.iterrows():
+            df_ = _parse_date(r['date_from']); dt_ = _parse_date(r['date_to'])
+            if df_ and dt_ and df_ <= date_obj <= dt_:
+                return float(r['fsc_pct']) / 100.0, 'range'
+    if default_fsc is not None:
+        return float(default_fsc) / 100.0, 'default'
+    return None, None
+
+def reconcile_txt(df_txt, rate_card, fsc_df, default_fsc=None):
+    """
+    Compare each TXT line against the rate card.
+    Auto-verify same-state metro PAL lines; flag interstate/regional/tonne for manual review.
+    default_fsc (percentage) is applied to any line whose date isn't covered by a date-range entry.
+    """
+    band = rate_card.get('metro_band') or [60, 35, 30, 25]
+    records = []
+    for _, row in df_txt.iterrows():
+        zone        = row.get('Zone', '')
+        uom         = str(row.get('UOM', '')).strip()
+        qty         = clean_number(row.get('Paid Qty', 0))
+        chg_rate    = clean_number(row.get('Rate', 0))
+        chg_freight = clean_number(row.get('Freight', 0))
+        chg_levy    = clean_number(row.get('LEVY', 0))
+        date_obj    = _parse_date(row.get('Date'))
+        o_state     = _origin_state(row.get('Origin', ''), zone)
+        d_state     = _dest_state(zone)
+        fsc, fsc_src = fsc_for_date(date_obj, fsc_df, default_fsc)
+
+        is_metro_pal = ('METRO' in str(zone).upper()) and uom == 'PAL' and (o_state == d_state)
+
+        rec = {
+            'Date': row.get('Date'),
+            'Delivery/Adjustment': row.get('Delivery/Adjustment'),
+            'Customer Name & Address': row.get('Customer Name & Address'),
+            'Zone': zone, 'UOM': uom, 'Qty': qty,
+            'Charged Rate': chg_rate, 'Charged Freight': round(chg_freight, 2),
+            'Charged LEVY': round(chg_levy, 2),
+            'Charged Total': round(chg_freight + chg_levy, 2),
+        }
+
+        if is_metro_pal:
+            exp_rate    = _band_rate(qty, band)
+            exp_freight = round(exp_rate * qty, 2)
+            if fsc is not None:
+                exp_levy  = round(exp_freight * fsc, 2)
+                exp_total = round(exp_freight + exp_levy, 2)
+                levy_diff = round(chg_levy - exp_levy, 2)
+            else:
+                exp_levy = exp_total = levy_diff = None
+            rec.update({
+                'Check': 'Auto (metro pallet)',
+                'Expected Rate': exp_rate,
+                'Expected Freight': exp_freight,
+                'FSC %': round(fsc * 100, 2) if fsc is not None else None,
+                'FSC Source': fsc_src,
+                'Expected LEVY': exp_levy,
+                'Expected Total': exp_total,
+                'Rate Diff': round(chg_rate - exp_rate, 2),
+                'Freight Diff': round(chg_freight - exp_freight, 2),
+                'LEVY Diff': levy_diff,
+                'Total Diff': round(chg_freight + chg_levy - exp_total, 2) if exp_total is not None else None,
+            })
+            ft_diff = abs(rec['Freight Diff']) > 0.01
+            lv_diff = (levy_diff is not None and abs(levy_diff) > 0.01)
+            if rec['FSC %'] is None:
+                rec['Status'] = '⚠ No FSC for date'
+            elif ft_diff or lv_diff:
+                rec['Status'] = '❌ Mismatch'
+            else:
+                rec['Status'] = '✓ OK'
+        else:
+            reason = []
+            if o_state != d_state: reason.append(f'interstate {o_state}→{d_state}')
+            if uom != 'PAL':       reason.append(f'UOM={uom}')
+            if 'METRO' not in str(zone).upper(): reason.append('non-metro zone')
+            rec.update({
+                'Check': 'Manual review (' + ', '.join(reason) + ')',
+                'Expected Rate': None, 'Expected Freight': None,
+                'FSC %': round(fsc * 100, 2) if fsc is not None else None,
+                'FSC Source': fsc_src,
+                'Expected LEVY': None, 'Expected Total': None,
+                'Rate Diff': None, 'Freight Diff': None, 'LEVY Diff': None, 'Total Diff': None,
+                'Status': '🔍 Manual review',
+            })
+        records.append(rec)
+
+    return pd.DataFrame(records)
+
+def reconcile_csv(df_csv, recon_txt_df):
+    """
+    Compare Machship CSV 'Total Sell' against the rate-card expected total
+    (from the auto-checked TXT lines), matched by 1800xxxxxx delivery ref.
+    """
+    if df_csv.empty:
+        return pd.DataFrame()
+
+    # Map delivery ref → expected total from TXT reconciliation (auto lines only)
+    exp_by_ref = {}
+    for _, r in recon_txt_df.iterrows():
+        ref = str(r.get('Delivery/Adjustment', '')).strip()
+        if r.get('Expected Total') is not None:
+            exp_by_ref[ref] = r['Expected Total']
+
+    rows = []
+    for _, row in df_csv.iterrows():
+        refs = re.findall(r'1800\d+', str(row.get('Reference 1', '')))
+        total_sell = clean_number(row.get('Total Sell', 0))
+        matched_exp = None
+        matched_ref = None
+        for ref in refs:
+            if ref in exp_by_ref:
+                matched_exp = exp_by_ref[ref]; matched_ref = ref; break
+        rows.append({
+            'Machship #': row.get('Machship #'),
+            'Reference 1': row.get('Reference 1'),
+            'To Name': row.get('To Name'),
+            'CSV Total Sell': round(total_sell, 2),
+            'Rate Card Expected': matched_exp,
+            'Diff': round(total_sell - matched_exp, 2) if matched_exp is not None else None,
+            'Status': ('—' if matched_exp is None
+                       else ('✓ OK' if abs(total_sell - matched_exp) <= 0.01 else '❌ Mismatch')),
+        })
+    return pd.DataFrame(rows)
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
 tab1, tab2, tab3 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation", "📸 Screenshot to Excel (Beta)"])
@@ -475,298 +724,214 @@ with tab1:
 # ════════════════════════════════════════════════════════════════════════════
 
 with tab2:
-    st.write("Upload both files to reconcile charges (.TXT) against invoice (.CSV).")
+    st.write(
+        "Compare the **carrier invoice (.TXT)** against the **agreed sell rate card** to catch over/undercharges. "
+        "Optionally add the **Machship shipment extract (.CSV)** to also check invoiced sell totals."
+    )
+    st.caption("🔒 Online build — nothing is stored. All files must be uploaded each session; they're held in memory only.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        recon_txt = st.file_uploader("Statement (.TXT)", type=['txt', 'TXT'], key="tab2_txt")
-    with col2:
+    # ── Uploaders ─────────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        recon_txt = st.file_uploader("① Carrier invoice (.TXT)", type=['txt', 'TXT'], key="tab2_txt")
+    with c2:
         recon_csvs = st.file_uploader(
-            "invoice(s) (.CSV) — select multiple if needed",
+            "② Machship extract (.CSV) — optional",
             type=['csv', 'CSV'], key="tab2_csv", accept_multiple_files=True
         )
+    with c3:
+        rate_card_file = st.file_uploader("③ Sell rate card (.xlsx) — required", type=['xlsx', 'XLSX'], key="tab2_ratecard")
 
-    if recon_txt and recon_csvs:
-        MAX_MB = 20
-        oversized = [f.name for f in recon_csvs if f.size > MAX_MB * 1024 * 1024]
-        if oversized:
-            st.error(f"⚠ Files exceed 20MB limit: {', '.join(oversized)}")
+    # ── Rate card: must be uploaded every session (no storage) ────────────
+    rate_card = None
+    if rate_card_file is not None:
+        try:
+            rate_card = parse_rate_card(rate_card_file)
+            st.success(
+                f"✓ Rate card loaded (this session only) — effective {rate_card.get('effective','?')}, "
+                f"metro pallet bands {rate_card.get('metro_band')}."
+            )
+        except Exception as e:
+            st.error(f"⚠ Could not parse rate card: {e}")
+    else:
+        st.warning("Upload the sell rate card in ③ to enable the checks. It is not stored, so it must be uploaded each session.")
+
+    # ── FSC (hardcoded, not confidential) ─────────────────────────────────
+    st.divider()
+    st.subheader("⛽ Fuel Surcharge (FSC)")
+    st.caption(
+        "FSC is hardcoded in the app (the only non-confidential metric). "
+        "To change it permanently, edit `CURRENT_FSC_PCT` / `FSC_OVERRIDES` at the top of the file. "
+        "You can also override it just for this session below."
+    )
+
+    fcol1, fcol2 = st.columns([1, 3])
+    with fcol1:
+        session_default = st.number_input(
+            "Default FSC % (this session)", min_value=0.0, max_value=100.0, step=0.01,
+            value=float(CURRENT_FSC_PCT), key="fsc_session_default"
+        )
+    with fcol2:
+        st.caption(
+            f"Hardcoded default is **{CURRENT_FSC_PCT}%**. The value here applies to every line "
+            "whose date isn't covered by a hardcoded date-range override (shown below). "
+            "Changing it here affects this session only — nothing is saved."
+        )
+
+    fsc_df = get_fsc_overrides_df()
+    default_fsc = float(session_default)
+
+    if not fsc_df.empty:
+        st.markdown("**Hardcoded date-range overrides:**")
+        show = fsc_df[['date_from', 'date_to', 'fsc_pct', 'note']].rename(
+            columns={'date_from': 'From', 'date_to': 'To', 'fsc_pct': 'FSC %', 'note': 'Note'})
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No date-range overrides configured — the default FSC applies to all lines.")
+
+    # ── Run reconciliation ────────────────────────────────────────────────
+    if recon_txt and rate_card:
+        if recon_txt.size > 20 * 1024 * 1024:
+            st.error("⚠ TXT file exceeds the 20MB limit.")
             st.stop()
 
-        with st.spinner("Reconciling..."):
-            df_txt, _ = parse_txt(recon_txt)
-            csv_frames = [parse_csv(f) for f in recon_csvs]
-            df_csv = pd.concat(csv_frames, ignore_index=True)
-            invoice_nums = df_csv['Invoice Number'].unique().tolist() if 'Invoice Number' in df_csv.columns else []
-            st.info(f"📄 {len(recon_csvs)} CSV file(s) loaded — Invoice(s): {', '.join(str(i) for i in invoice_nums)}")
+        with st.spinner("Reconciling against rate card..."):
+            df_txt, client_total = parse_txt(recon_txt)
+            recon_df = reconcile_txt(df_txt, rate_card, fsc_df, default_fsc)
 
-            txt_deliveries = set(df_txt['Delivery/Adjustment'].dropna().str.strip().unique())
-            csv_deliveries = set()
-            for ref in df_csv['Customer Reference'].dropna():
-                for r in split_customer_refs(ref):
-                    csv_deliveries.add(r)
+            df_csv_combined = parse_consignment_csvs(recon_csvs) if recon_csvs else pd.DataFrame()
+            csv_recon_df = reconcile_csv(df_csv_combined, recon_df) if not df_csv_combined.empty else pd.DataFrame()
 
-            df_txt['Reconciliation Status'] = df_txt['Delivery/Adjustment'].apply(
-                lambda x: '✓ Matched' if x in csv_deliveries else 'Invoice not found on warehouse invoice'
-            )
-            df_csv['Reconciliation Status'] = df_csv['Customer Reference'].apply(
-                lambda x: '✓ Matched' if any(r in txt_deliveries for r in split_customer_refs(x))
-                          else 'Invoice not found on warehouse invoice'
-            )
-            df_matched_txt = df_txt[df_txt['Reconciliation Status'] == '✓ Matched'].copy()
-            df_matched_csv = df_csv[df_csv['Reconciliation Status'] == '✓ Matched'].copy()
-
-        # State filter
+        # Helper: implied FSC from invoice for cross-checking
         st.divider()
-        available_states = sorted(df_txt['State'].dropna().unique().tolist())
-        selected_state   = st.selectbox("Filter by State", ['All'] + available_states, index=0, key="tab2_state_filter")
+        with st.expander("🔎 Implied FSC from invoice (LEVY ÷ Freight) — to cross-check the hardcoded FSC"):
+            tmp = df_txt.copy()
+            tmp['_f'] = tmp['Freight'].apply(clean_number)
+            tmp['_l'] = tmp['LEVY'].apply(clean_number)
+            tmp = tmp[tmp['_f'] > 0]
+            tmp['Implied FSC %'] = (tmp['_l'] / tmp['_f'] * 100).round(2)
+            implied = tmp.groupby('Date')['Implied FSC %'].agg(lambda s: ', '.join(map(str, sorted(s.unique())))).reset_index()
+            st.dataframe(implied, use_container_width=True, hide_index=True)
 
-        if selected_state == 'All':
-            df_txt_filtered  = df_txt.copy()
-            df_matched_txt_f = df_matched_txt.copy()
-            df_matched_csv_f = df_matched_csv.copy()
+        # ── Metrics ────────────────────────────────────────────────────────
+        auto = recon_df[recon_df['Check'].str.startswith('Auto')]
+        mismatches = recon_df[recon_df['Status'] == '❌ Mismatch']
+        st.divider()
+        st.subheader("① Invoice (.TXT) vs Rate Card")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Invoice lines", len(recon_df))
+        m2.metric("Auto-checked", len(auto))
+        m3.metric("Mismatches", len(mismatches))
+        manual_n = (recon_df['Status'] == '🔍 Manual review').sum()
+        m4.metric("Manual review", int(manual_n))
+
+        auto_var = auto.dropna(subset=['Total Diff'])
+        if not auto_var.empty:
+            tot_chg = round(auto_var['Charged Total'].sum(), 2)
+            tot_exp = round(auto_var['Expected Total'].sum(), 2)
+            var = round(tot_chg - tot_exp, 2)
+            v1, v2, v3 = st.columns(3)
+            v1.metric("Charged (auto lines)",  f"${tot_chg:,.2f}")
+            v2.metric("Expected (auto lines)", f"${tot_exp:,.2f}")
+            v3.metric("Variance", f"${var:,.2f}", delta=f"{'Overcharged' if var>0 else 'Undercharged' if var<0 else 'Even'}")
         else:
-            df_txt_filtered  = df_txt[df_txt['State'] == selected_state].copy()
-            filtered_dels    = set(df_txt_filtered['Delivery/Adjustment'].dropna().str.strip())
-            df_matched_txt_f = df_matched_txt[df_matched_txt['Delivery/Adjustment'].isin(filtered_dels)].copy()
-            df_matched_csv_f = df_matched_csv[
-                df_matched_csv['Customer Reference'].apply(
-                    lambda x: any(r in filtered_dels for r in split_customer_refs(str(x)))
-                )
-            ].copy()
+            tot_chg = tot_exp = var = 0.0
 
-        # Section 1
-        st.divider()
-        st.subheader("① Line Item Check")
-        unmatched_txt = df_txt_filtered[df_txt_filtered['Reconciliation Status'] != '✓ Matched']
-        unmatched_csv = df_csv[df_csv['Reconciliation Status'] != '✓ Matched']
+        # ── Highlighted table ────────────────────────────────────────────────
+        st.caption("Rows where the invoice differs from the rate card are highlighted red. 🔍 = needs manual review (interstate / regional / tonne).")
 
-        if unmatched_txt.empty and unmatched_csv.empty:
-            st.success("✓ All invoice lines found")
-        else:
-            if not unmatched_txt.empty:
-                st.warning(f"⚠ {len(unmatched_txt)} TXT line(s) not found in .CSV invoice")
-                st.dataframe(unmatched_txt[['Delivery/Adjustment','State','Origin','Total (AUD)','GST (AUD)','Reconciliation Status']], use_container_width=True, hide_index=True)
-            if not unmatched_csv.empty:
-                st.warning(f"⚠ {len(unmatched_csv)} CSV line(s) not found in .TXT statement")
-                st.dataframe(unmatched_csv[['Customer Reference','Total','Reconciliation Status']], use_container_width=True, hide_index=True)
+        display_cols = ['Status', 'Check', 'Date', 'Delivery/Adjustment', 'Customer Name & Address',
+                        'Zone', 'UOM', 'Qty',
+                        'Charged Rate', 'Expected Rate', 'Rate Diff',
+                        'Charged Freight', 'Expected Freight', 'Freight Diff',
+                        'FSC %', 'FSC Source', 'Charged LEVY', 'Expected LEVY', 'LEVY Diff',
+                        'Charged Total', 'Expected Total', 'Total Diff']
+        display_cols = [c for c in display_cols if c in recon_df.columns]
 
-        # Section 2
-        st.divider()
-        st.subheader("② Comparison Table")
-        st.caption("Matched lines only — TXT vs CSV side by side.")
-
-        comparison_rows = []
-        for _, csv_row in df_matched_csv_f.iterrows():
-            refs        = split_customer_refs(csv_row['Customer Reference'])
-            matched_txt = df_matched_txt_f[df_matched_txt_f['Delivery/Adjustment'].isin(refs)]
-            comparison_rows.append({
-                'Customer Reference':  csv_row['Customer Reference'],
-                'TXT Load Qty':        round(matched_txt['Load Qty'].sum(), 3),
-                'CSV Total Cubic':     csv_row['Total Cubic'],
-                'TXT Paid Qty':        round(matched_txt['Paid Qty'].sum(), 3),
-                'CSV Quantity':        csv_row['Quantity'],
-                'TXT Freight':         round(matched_txt['Freight'].sum(), 2),
-                'CSV Rate Charge':     csv_row['Rate Charge'],
-                'TXT LEVY':            round(matched_txt['LEVY'].sum(), 2),
-                'CSV Fuel Levy':       csv_row['Fuel Levy'],
-                'TXT Total (AUD)':     round(matched_txt['Total (AUD)'].sum(), 2),
-                'CSV Rate+Fuel Levy':  csv_row['Rate Charge and Fuel Levy'],
-                'TXT GST':             round(matched_txt['GST (AUD)'].sum(), 2),
-                'CSV Total Tax':       csv_row['Total Tax'],
-                'TXT Final Total':     round(matched_txt['Final Total'].sum(), 2),
-                'CSV Total':           csv_row['Total'],
-            })
-
-        df_compare = pd.DataFrame(comparison_rows)
-
-        compare_pairs = [
-            ('TXT Load Qty','CSV Total Cubic'),('TXT Paid Qty','CSV Quantity'),
-            ('TXT Freight','CSV Rate Charge'),('TXT LEVY','CSV Fuel Levy'),
-            ('TXT Total (AUD)','CSV Rate+Fuel Levy'),('TXT GST','CSV Total Tax'),
-            ('TXT Final Total','CSV Total'),
-        ]
-        csv_to_txt = {c: t for t, c in compare_pairs}
-
-        TXT_BG  = 'background-color: #1a2a45; color: #a8c4e0'
-        CSV_BG  = 'background-color: #1a3a35; color: #a8d4cc'
-        CSV_RED = 'background-color: #a83232; color: white'
-        CSV_GRN = 'background-color: #1a7a1a; color: white'
-
-        def style_comparison(df):
+        def style_recon(df):
             styles = pd.DataFrame('', index=df.index, columns=df.columns)
-            for col in df.columns:
-                if col == 'Customer Reference': continue
-                elif col.startswith('TXT'): styles[col] = TXT_BG
-                elif col.startswith('CSV'):
-                    txt_col = csv_to_txt.get(col)
-                    if txt_col and txt_col in df.columns:
-                        for i in range(len(df)):
-                            try:
-                                cv, tv = float(df[col].iloc[i]), float(df[txt_col].iloc[i])
-                                styles.iloc[i, df.columns.get_loc(col)] = CSV_GRN if tv > cv else (CSV_RED if cv > tv else CSV_BG)
-                            except:
-                                styles.iloc[i, df.columns.get_loc(col)] = CSV_BG
-                    else: styles[col] = CSV_BG
+            for i in range(len(df)):
+                status = df.iloc[i]['Status']
+                if status == '❌ Mismatch':
+                    styles.iloc[i, :] = 'background-color: #4a1a1a; color: #ffb3b3'
+                elif status == '🔍 Manual review':
+                    styles.iloc[i, :] = 'background-color: #3a3320; color: #e0d4a8'
+                elif status == '⚠ No FSC for date':
+                    styles.iloc[i, :] = 'background-color: #3a2e1a; color: #e8c98a'
+                elif status == '✓ OK':
+                    styles.iloc[i, :] = 'background-color: #14241a; color: #a8d4b4'
             return styles
 
-        total_txt     = len(df_matched_txt_f)
-        total_csv     = len(df_matched_csv_f)
-        exact_matches = sum(
-            1 for _, row in df_compare.iterrows()
-            if all(float(row[cc]) == float(row[tc]) for tc, cc in [('TXT Freight','CSV Rate Charge'),('TXT LEVY','CSV Fuel Levy'),('TXT Final Total','CSV Total')])
-        )
-        col1, col2, col3 = st.columns(3)
-        col1.metric("TXT Lines Matched", total_txt)
-        col2.metric("CSV Lines Matched", total_csv)
-        col3.metric("Exact Value Matches", f"{exact_matches} / {total_csv}")
+        st.dataframe(recon_df[display_cols].style.apply(style_recon, axis=None),
+                     use_container_width=True, hide_index=True)
 
-        st.caption("🔵 TXT columns (dark blue)  |  🟩 CSV columns (teal = match, green = higher, red = lower)")
-        st.dataframe(df_compare.style.apply(style_comparison, axis=None), use_container_width=True, hide_index=True)
+        # ── CSV vs rate card ──────────────────────────────────────────────────
+        if not csv_recon_df.empty:
+            st.divider()
+            st.subheader("② Machship (.CSV) Sell Totals vs Rate Card")
+            matched_csv = csv_recon_df[csv_recon_df['Rate Card Expected'].notna()]
+            csv_mism = matched_csv[matched_csv['Status'] == '❌ Mismatch']
+            cm1, cm2, cm3 = st.columns(3)
+            cm1.metric("CSV rows", len(csv_recon_df))
+            cm2.metric("Matched to rate card", len(matched_csv))
+            cm3.metric("Mismatches", len(csv_mism))
+            st.caption("Compares CSV 'Total Sell' to the rate-card expected total (auto lines). Mismatches highlighted red.")
 
-        # Section 3
-        st.divider()
-        st.subheader("③ Discrepancies")
-
-        pairs = [
-            ('TXT Freight','CSV Rate Charge','Rate Charge'),
-            ('TXT LEVY','CSV Fuel Levy','Fuel Levy'),
-            ('TXT GST','CSV Total Tax','Total Tax'),
-            ('TXT Final Total','CSV Total','Total'),
-        ]
-        discrepancy_rows = []
-        for _, row in df_compare.iterrows():
-            diffs = {}
-            for tc, cc, label in pairs:
-                diff = round(float(row[cc]) - float(row[tc]), 2)
-                if diff != 0:
-                    diffs[f'TXT {label}'] = row[tc]
-                    diffs[f'CSV {label}'] = row[cc]
-                    diffs[f'Diff {label}'] = diff
-            if diffs:
-                discrepancy_rows.append({'Customer Reference': row['Customer Reference'], **diffs})
-
-        if not discrepancy_rows:
-            st.success("✓ No discrepancies found")
-        else:
-            st.error(f"⚠ {len(discrepancy_rows)} row(s) with discrepancies")
-            df_disc = pd.DataFrame(discrepancy_rows)
-
-            def highlight_diffs(df):
+            def style_csv(df):
                 styles = pd.DataFrame('', index=df.index, columns=df.columns)
-                for col in df.columns:
-                    if col == 'Customer Reference': continue
-                    elif col.startswith('TXT '): styles[col] = 'background-color: #1a2a45; color: #a8c4e0'
-                    elif col.startswith('CSV '): styles[col] = 'background-color: #1a3a35; color: #a8d4cc'
-                    elif col.startswith('Diff '):
-                        for i, val in enumerate(df[col]):
-                            if pd.notna(val):
-                                try:
-                                    styles.iloc[i, df.columns.get_loc(col)] = (
-                                        'background-color: #1a7a1a; color: white' if float(val) < 0
-                                        else 'background-color: #a83232; color: white' if float(val) > 0 else ''
-                                    )
-                                except: pass
+                for i in range(len(df)):
+                    if df.iloc[i]['Status'] == '❌ Mismatch':
+                        styles.iloc[i, :] = 'background-color: #4a1a1a; color: #ffb3b3'
+                    elif df.iloc[i]['Status'] == '✓ OK':
+                        styles.iloc[i, :] = 'background-color: #14241a; color: #a8d4b4'
                 return styles
 
-            st.caption("🔵 TXT  |  🟩 CSV  |  🟢 Diff negative (CSV lower)  |  🔴 Diff positive (CSV higher)")
-            st.dataframe(df_disc.style.apply(highlight_diffs, axis=None), use_container_width=True, hide_index=True)
+            st.dataframe(csv_recon_df.style.apply(style_csv, axis=None),
+                         use_container_width=True, hide_index=True)
 
-        # Download
+        # ── Download Excel ──────────────────────────────────────────────────
         st.divider()
-        st.subheader("⬇️ Download Reconciliation Report")
 
-        def build_recon_tables(df_txt_in, df_csv_in, df_matched_txt_in, df_matched_csv_in):
-            unmatched_t = df_txt_in[df_txt_in['Reconciliation Status'] != '✓ Matched'][['Delivery/Adjustment','State','Origin','Total (AUD)','GST (AUD)','Reconciliation Status']].copy()
-            unmatched_c = df_csv_in[df_csv_in['Reconciliation Status'] != '✓ Matched'][['Customer Reference','Total','Reconciliation Status']].copy()
-            comp_rows = []
-            for _, csv_row in df_matched_csv_in.iterrows():
-                refs = split_customer_refs(csv_row['Customer Reference'])
-                mtxt = df_matched_txt_in[df_matched_txt_in['Delivery/Adjustment'].isin(refs)]
-                comp_rows.append({
-                    'Customer Reference': csv_row['Customer Reference'],
-                    'TXT Load Qty': round(mtxt['Load Qty'].sum(), 3),
-                    'CSV Total Cubic': csv_row['Total Cubic'],
-                    'TXT Paid Qty': round(mtxt['Paid Qty'].sum(), 3),
-                    'CSV Quantity': csv_row['Quantity'],
-                    'TXT Freight': round(mtxt['Freight'].sum(), 2),
-                    'CSV Rate Charge': csv_row['Rate Charge'],
-                    'TXT LEVY': round(mtxt['LEVY'].sum(), 2),
-                    'CSV Fuel Levy': csv_row['Fuel Levy'],
-                    'TXT Total (AUD)': round(mtxt['Total (AUD)'].sum(), 2),
-                    'CSV Rate+Fuel Levy': csv_row['Rate Charge and Fuel Levy'],
-                    'TXT GST': round(mtxt['GST (AUD)'].sum(), 2),
-                    'CSV Total Tax': csv_row['Total Tax'],
-                    'TXT Final Total': round(mtxt['Final Total'].sum(), 2),
-                    'CSV Total': csv_row['Total'],
-                })
-            df_comp = pd.DataFrame(comp_rows) if comp_rows else pd.DataFrame()
-            disc_rows = []
-            for _, row in df_comp.iterrows():
-                diffs = {}
-                for tc, cc, label in [('TXT Freight','CSV Rate Charge','Rate Charge'),('TXT LEVY','CSV Fuel Levy','Fuel Levy'),('TXT GST','CSV Total Tax','Total Tax'),('TXT Final Total','CSV Total','Total')]:
-                    diff = round(float(row[cc]) - float(row[tc]), 2)
-                    if diff != 0:
-                        diffs[f'TXT {label}'] = row[tc]; diffs[f'CSV {label}'] = row[cc]; diffs[f'Diff {label}'] = diff
-                if diffs: disc_rows.append({'Customer Reference': row['Customer Reference'], **diffs})
-            return unmatched_t, unmatched_c, df_comp, pd.DataFrame(disc_rows) if disc_rows else pd.DataFrame()
+        def build_recon_card_excel(recon_df, csv_recon_df):
+            wb = Workbook(); wb.remove(wb.active)
+            red  = PatternFill('solid', start_color='C00000')
+            grn  = PatternFill('solid', start_color='1F7A1F')
+            yel  = PatternFill('solid', start_color='B8860B')
+            hdrf = PatternFill('solid', start_color='1F4E79')
 
-        def write_recon_sheet(ws, label, ut, uc, dc, dd):
-            ws.cell(row=1, column=1, value=f'Reconciliation — {label}').font = Font(bold=True, size=14)
-            def write_sec(ws, title, df_in, row):
-                ws.cell(row=row, column=1, value=title).font = Font(bold=True, size=12)
-                row += 1
-                if df_in is None or df_in.empty:
-                    ws.cell(row=row, column=1, value='No data').font = Font(italic=True)
-                    return row + 2
-                for c, col in enumerate(df_in.columns, 1):
-                    cell = ws.cell(row=row, column=c, value=col)
-                    cell.font = Font(bold=True, color='FFFFFF')
-                    cell.fill = PatternFill('solid', start_color='1F4E79')
-                row += 1
-                for _, r in df_in.iterrows():
-                    for c, val in enumerate(r, 1):
-                        cell = ws.cell(row=row, column=c, value=val)
-                        if df_in.columns[c-1].startswith('Diff '):
-                            try:
-                                v = float(val)
-                                cell.fill = PatternFill('solid', start_color='1a7a1a' if v < 0 else 'a83232')
-                                cell.font = Font(color='FFFFFF')
-                            except: pass
-                    row += 1
-                return row + 2
-            r = 3
-            r = write_sec(ws, '① TXT not in .CSV Invoice', ut, r)
-            r = write_sec(ws, '① CSV not in .TXT Statement', uc, r)
-            r = write_sec(ws, '② Comparison Table', dc, r)
-            r = write_sec(ws, '③ Discrepancies', dd, r)
+            def write_df(ws, df, title):
+                ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=13)
+                cols = list(df.columns)
+                for c, col in enumerate(cols, 1):
+                    cell = ws.cell(row=2, column=c, value=col)
+                    cell.font = Font(bold=True, color='FFFFFF'); cell.fill = hdrf
+                for r, (_, row) in enumerate(df.iterrows(), 3):
+                    status = row.get('Status', '')
+                    for c, col in enumerate(cols, 1):
+                        val = row[col]
+                        if isinstance(val, float): val = round(val, 2)
+                        cell = ws.cell(row=r, column=c, value=val)
+                        if status == '❌ Mismatch':
+                            cell.fill = red; cell.font = Font(color='FFFFFF')
+                        elif status == '🔍 Manual review':
+                            cell.fill = yel; cell.font = Font(color='FFFFFF')
+                        elif status == '✓ OK':
+                            cell.fill = grn; cell.font = Font(color='FFFFFF')
 
-        def build_recon_excel(df_txt_f, df_csv_f, df_mt_f, df_mc_f):
-            wb  = Workbook()
-            wb.remove(wb.active)
-            states = sorted(df_txt_f['State'].dropna().unique().tolist())
-            for label, state_filter in [('All', None)] + [(s, s) for s in states]:
-                if state_filter is None:
-                    t, mt, mc = df_txt_f, df_mt_f, df_mc_f
-                else:
-                    t   = df_txt_f[df_txt_f['State'] == state_filter].copy()
-                    fd  = set(t['Delivery/Adjustment'].dropna().str.strip())
-                    mt  = df_mt_f[df_mt_f['Delivery/Adjustment'].isin(fd)].copy()
-                    mc  = df_mc_f[df_mc_f['Customer Reference'].apply(lambda x: any(r in fd for r in split_customer_refs(str(x))))].copy()
-                ut, uc, dc, dd = build_recon_tables(t, df_csv_f, mt, mc)
-                write_recon_sheet(wb.create_sheet(title=f'Recon - {label}'), label, ut, uc, dc, dd)
-            buf = io.BytesIO()
-            wb.save(buf)
-            buf.seek(0)
+            write_df(wb.create_sheet("TXT vs Rate Card"), recon_df, "Invoice (.TXT) vs Rate Card")
+            if not csv_recon_df.empty:
+                write_df(wb.create_sheet("CSV vs Rate Card"), csv_recon_df, "Machship (.CSV) vs Rate Card")
+            buf = io.BytesIO(); wb.save(buf); buf.seek(0)
             return buf
 
-        recon_buf = build_recon_excel(df_txt, df_csv, df_matched_txt, df_matched_csv)
+        excel_buf = build_recon_card_excel(recon_df, csv_recon_df)
         st.download_button(
-            label="⬇️ Download Reconciliation Report (.xlsx)",
-            data=recon_buf,
-            file_name=f'invoice_reconciliation.xlsx',
+            "⬇️ Download Reconciliation Report (.xlsx)",
+            data=excel_buf,
+            file_name="rate_card_reconciliation.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Screenshot to Excel (free OCR via pytesseract)
