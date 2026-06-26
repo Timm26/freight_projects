@@ -297,11 +297,11 @@ with tab1:
                 df_csv_combined = parse_consignment_csvs(uploaded_csvs)
                 df = enrich_txt_with_csv(df, df_csv_combined)
                 csv_matched = int(df['Machship #'].notna().sum())
-                csv_unmatched = len(df) - csv_matched
-                if csv_unmatched == 0:
-                    st.success(f"✓ {len(uploaded_csvs)} consignment CSV(s) loaded — all {csv_matched} TXT rows matched with shipment data.")
+                total = len(df)
+                if csv_matched == total:
+                    st.success(f"✓ {csv_matched}/{total} shipments on TXT matched with consignment data.")
                 else:
-                    st.info(f"📦 {len(uploaded_csvs)} consignment CSV(s) loaded — {csv_matched}/{len(df)} TXT rows matched. {csv_unmatched} rows have no matching shipment in the uploaded CSV(s).")
+                    st.warning(f"⚠ {csv_matched}/{total} shipments on TXT matched with consignment data.")
             else:
                 df['VIP'] = False
                 df['VIP Reason'] = ''
