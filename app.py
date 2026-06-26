@@ -174,7 +174,7 @@ def build_excel(df, client_total):
 
     # Determine which extra columns exist from CSV enrichment
     extra_cols = [c for c in ['Carrier', 'Machship #', 'Service',
-                               'Delivery Special Instructions', 'VIP', 'VIP Reason']
+                               'Delivery Special Instructions', 'VIP']
                   if c in df.columns]
 
     base_headers = [c for c in df.columns
@@ -237,28 +237,58 @@ def build_excel(df, client_total):
     ws_sum.cell(row=grand_row+3, column=2,
                 value=f'=IF(E{grand_row}=B{grand_row+2},"✓ MATCH","⚠ DISCREPANCY")')
 
-    # Part B: VIP breakdown by state (only if VIP column exists)
+    # Part B: VIP breakdown per state (only if VIP column exists)
     if 'VIP' in df.columns:
-        vip_start = grand_row + 6
-        ws_sum.cell(row=vip_start, column=1, value='VIP / Special Service Breakdown').font = Font(bold=True, size=12)
-        vip_headers = ['State', 'Delivery/Adjustment', 'Customer Name & Address',
-                       'Service', 'Delivery Special Instructions', 'VIP Reason',
+        vip_headers = ['Delivery/Adjustment', 'Customer Name & Address',
+                       'Service', 'Delivery Special Instructions',
                        'Total (AUD)', 'GST (AUD)', 'Total (inc GST)']
         vip_headers_filtered = [h for h in vip_headers if h in df.columns or h in ['Total (inc GST)']]
-        for col, header in enumerate(vip_headers_filtered, 1):
-            cell = ws_sum.cell(row=vip_start+1, column=col, value=header)
-            cell.font = Font(bold=True, color='FFFFFF')
-            cell.fill = PatternFill('solid', start_color='8B0000')
+        num_cols = len(vip_headers_filtered)
 
-        vip_df = df[df['VIP'] == True].sort_values('State')
-        vr = vip_start + 2
-        for _, row in vip_df.iterrows():
-            for col, header in enumerate(vip_headers_filtered, 1):
-                if header == 'Total (inc GST)':
-                    ws_sum.cell(row=vr, column=col, value=round(row['Total (AUD)'] + row['GST (AUD)'], 2))
-                else:
-                    ws_sum.cell(row=vr, column=col, value=row.get(header, ''))
+        total_col_idx  = vip_headers_filtered.index('Total (AUD)') + 1
+        gst_col_idx    = vip_headers_filtered.index('GST (AUD)') + 1
+        incgst_col_idx = vip_headers_filtered.index('Total (inc GST)') + 1
+
+        vip_df = df[df['VIP'] == True]
+        vip_states = sorted(vip_df['State'].unique())
+
+        vr = grand_row + 6  # start row for first state table
+
+        for state in vip_states:
+            state_vip = vip_df[vip_df['State'] == state]
+
+            # Section heading
+            heading_cell = ws_sum.cell(row=vr, column=1, value=f'VIP / Special Service Breakdown — {state}')
+            heading_cell.font = Font(bold=True, size=12)
             vr += 1
+
+            # Header row
+            for col, header in enumerate(vip_headers_filtered, 1):
+                cell = ws_sum.cell(row=vr, column=col, value=header)
+                cell.font = Font(bold=True, color='FFFFFF')
+                cell.fill = PatternFill('solid', start_color='8B0000')
+            vr += 1
+
+            data_start = vr
+            # Data rows
+            for _, row in state_vip.iterrows():
+                for col, header in enumerate(vip_headers_filtered, 1):
+                    if header == 'Total (inc GST)':
+                        ws_sum.cell(row=vr, column=col, value=round(row['Total (AUD)'] + row['GST (AUD)'], 2))
+                    else:
+                        ws_sum.cell(row=vr, column=col, value=row.get(header, ''))
+                vr += 1
+
+            # Totals row
+            tot_total  = round(state_vip['Total (AUD)'].sum(), 2)
+            tot_gst    = round(state_vip['GST (AUD)'].sum(), 2)
+            tot_incgst = round(tot_total + tot_gst, 2)
+
+            ws_sum.cell(row=vr, column=1, value='TOTAL').font = Font(bold=True)
+            ws_sum.cell(row=vr, column=total_col_idx,  value=tot_total).font  = Font(bold=True)
+            ws_sum.cell(row=vr, column=gst_col_idx,    value=tot_gst).font    = Font(bold=True)
+            ws_sum.cell(row=vr, column=incgst_col_idx, value=tot_incgst).font = Font(bold=True)
+            vr += 3  # gap before next state table
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -302,6 +332,12 @@ with tab1:
                     st.success(f"✓ {csv_matched}/{total} shipments on TXT matched with consignment data.")
                 else:
                     st.warning(f"⚠ {csv_matched}/{total} shipments on TXT matched with consignment data.")
+                    unmatched_df = df[df['Machship #'].isna()]
+                    with st.expander(f"Show {len(unmatched_df)} TXT shipment(s) still needing consignment data"):
+                        st.dataframe(
+                            unmatched_df[['Date', 'Truck', 'State', 'Delivery/Adjustment', 'Customer Name & Address']],
+                            use_container_width=True, hide_index=True
+                        )
             else:
                 df['VIP'] = False
                 df['VIP Reason'] = ''
@@ -368,7 +404,7 @@ with tab1:
                 st.session_state['vip_excluded'] = set()
 
             display_cols = ['State', 'Delivery/Adjustment', 'Customer Name & Address',
-                            'Service', 'Delivery Special Instructions', 'VIP Reason',
+                            'Service', 'Delivery Special Instructions',
                             'Total (AUD)', 'GST (AUD)']
             display_cols = [c for c in display_cols if c in vip_df.columns]
 
