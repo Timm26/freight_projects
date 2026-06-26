@@ -117,11 +117,12 @@ def enrich_txt_with_csv(df_txt, df_csv):
         df_txt['VIP Reason'] = ''
         return df_txt
 
-    # Build lookup: ref_number → first matching CSV row
+    # Build lookup: only index CSV refs that exist in the TXT (ignore unrelated CSV rows)
+    txt_refs = set(df_txt['Delivery/Adjustment'].dropna().str.strip())
     ref_lookup = {}
     for _, row in df_csv.iterrows():
         for ref in extract_all_refs(str(row.get('Reference 1', ''))):
-            if ref not in ref_lookup:
+            if ref in txt_refs and ref not in ref_lookup:
                 ref_lookup[ref] = row
 
     enriched_rows = []
@@ -295,8 +296,12 @@ with tab1:
             if uploaded_csvs:
                 df_csv_combined = parse_consignment_csvs(uploaded_csvs)
                 df = enrich_txt_with_csv(df, df_csv_combined)
-                csv_matched = df['Machship #'].notna().sum()
-                st.info(f"📦 {len(uploaded_csvs)} consignment CSV(s) loaded — matched {csv_matched}/{len(df)} TXT rows with shipment data.")
+                csv_matched = int(df['Machship #'].notna().sum())
+                csv_unmatched = len(df) - csv_matched
+                if csv_unmatched == 0:
+                    st.success(f"✓ {len(uploaded_csvs)} consignment CSV(s) loaded — all {csv_matched} TXT rows matched with shipment data.")
+                else:
+                    st.info(f"📦 {len(uploaded_csvs)} consignment CSV(s) loaded — {csv_matched}/{len(df)} TXT rows matched. {csv_unmatched} rows have no matching shipment in the uploaded CSV(s).")
             else:
                 df['VIP'] = False
                 df['VIP Reason'] = ''
