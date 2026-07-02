@@ -30,10 +30,21 @@ st.title("🚛 Data Processing Toolbox")
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 STATES   = ['VIC', 'NSW', 'QLD', 'SA', 'WA', 'TAS', 'NT', 'ACT']
-ZONE_MAP = {
-    'YV': 'VIC', 'YN': 'NSW', 'YQ': 'QLD', 'YS': 'SA',
-    'YW': 'WA',  'YT': 'TAS', 'YD': 'NT',  'YA': 'ACT'
+
+# The SECOND character of a Y-prefixed Zone code identifies the destination
+# state, e.g. YNSYDMETRO -> N -> NSW, YVMELMETRO -> V -> VIC. The Zone is the
+# reliable destination field; the Origin column holds warehouse / free-text
+# notes and must not be used for state detection.
+ZONE_LETTER_STATE = {
+    'V': 'VIC', 'N': 'NSW', 'Q': 'QLD', 'S': 'SA',
+    'W': 'WA',  'T': 'TAS', 'D': 'NT',  'A': 'ACT'
 }
+
+# For these invoices only NSW and VIC are valid destination states. Sydney metro
+# (any *SYDMETRO zone) is folded into NSW. Anything that can't be resolved to one
+# of these is routed to a "TBC" review sheet.
+VALID_STATES = {'NSW', 'VIC'}
+
 HEADER_COLOR = '1F4E79'
 
 VIP_SERVICE_KEYWORDS   = ['vip', 'elite']
@@ -53,12 +64,26 @@ def clean_number(val):
         return 0.0
 
 def get_state(row):
-    origin = str(row['Origin'])
-    for state in STATES:
-        if state in origin:
-            return state
-    zone = str(row['Zone'])
-    return ZONE_MAP.get(zone[:2].upper(), 'UNKNOWN')
+    """Derive the delivery state from the Zone code.
+
+    Zone format is Y<state-letter><location>, e.g. YNSYDMETRO, YVMELMETRO.
+      • Any *SYDMETRO zone            -> 'NSW'  (Sydney metro folded into NSW)
+      • NSW or VIC zones              -> 'NSW' / 'VIC'
+      • Everything else (other states,
+        blank or unrecognised zones)  -> 'TBC'
+
+    The Origin column is deliberately NOT used: it contains warehouse and
+    free-text notes (e.g. 'MERGED SHIPMENT', 'ex 6722 Rohlig NSW ...') that
+    caused false matches such as NT (from "shipmeNT") and QLD.
+    """
+    zone = str(row.get('Zone', '')).strip().upper()
+    if not zone or zone == 'NAN':
+        return 'TBC'
+    if 'SYDMETRO' in zone:
+        return 'NSW'
+    letter = zone[1] if len(zone) >= 2 and zone[0] == 'Y' else ''
+    state  = ZONE_LETTER_STATE.get(letter)
+    return state if state in VALID_STATES else 'TBC'
 
 def split_customer_refs(ref_str):
     parts = re.split(r'[,&]+', str(ref_str))
@@ -291,6 +316,28 @@ def build_excel(df, client_total):
             ws_sum.cell(row=vr, column=gst_col_idx,    value=tot_gst).font    = Font(bold=True)
             ws_sum.cell(row=vr, column=incgst_col_idx, value=tot_incgst).font = Font(bold=True)
             vr += 3  # gap before next state table
+
+    # ── raw_data sheet: every invoice line, not split by state ─────────────
+    # Placed at index 1 so it sits right after the Summary sheet.
+    ws_raw = wb.create_sheet(title='raw_data', index=1)
+    for col, header in enumerate(headers_with_state, 1):
+        cell = ws_raw.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill('solid', start_color=HEADER_COLOR)
+    for row_idx, (_, row) in enumerate(df.reindex(columns=headers_with_state).iterrows(), 2):
+        for col_idx, val in enumerate(row, 1):
+            ws_raw.cell(row=row_idx, column=col_idx, value=val)
+    # Grand total across all lines
+    raw_total_row = len(df) + 2
+    raw_total_col = headers_with_state.index('Total (AUD)') + 1
+    raw_gst_col   = headers_with_state.index('GST (AUD)') + 1
+    ws_raw.cell(row=raw_total_row, column=1, value='TOTAL').font = Font(bold=True)
+    ws_raw.cell(row=raw_total_row, column=raw_total_col,
+                value=f'=SUM({get_column_letter(raw_total_col)}2:{get_column_letter(raw_total_col)}{raw_total_row-1})'
+                ).font = Font(bold=True)
+    ws_raw.cell(row=raw_total_row, column=raw_gst_col,
+                value=f'=SUM({get_column_letter(raw_gst_col)}2:{get_column_letter(raw_gst_col)}{raw_total_row-1})'
+                ).font = Font(bold=True)
 
     buffer = io.BytesIO()
     wb.save(buffer)
