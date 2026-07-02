@@ -194,11 +194,11 @@ def parse_csv(uploaded_file):
         df[col] = df[col].apply(clean_number)
     return df
 
-def build_excel(df, client_total):
-    """Build the split Excel. Sheets are per-state (not per truck/state)."""
-    wb = Workbook()
-    wb.remove(wb.active)
-
+def _populate_split_sheets(wb, df, client_total):
+    """Populate `wb` (whose default active sheet has already been removed) with the
+    standard split: per-state sheets, a Summary sheet, and a raw_data sheet (sorted
+    by the 1800 reference with repeated references highlighted). Shared by the Tab 1
+    processor and the Tab 4 master build so both produce an identical split."""
     # Determine which extra columns exist from CSV enrichment
     extra_cols = [c for c in ['Carrier', 'Machship #', 'Service',
                                'Delivery Special Instructions', 'VIP']
@@ -320,15 +320,49 @@ def build_excel(df, client_total):
     # ── raw_data sheet: every invoice line, not split by state ─────────────
     # Placed at index 1 so it sits right after the Summary sheet.
     ws_raw = wb.create_sheet(title='raw_data', index=1)
+
+    # Column G is the Delivery/Adjustment reference (the 1800xxxxx). Parse it to a
+    # number, sort the sheet by it ascending, and highlight any reference that
+    # appears more than once (e.g. a charge line plus its matching fuel-levy line).
+    ref_col_name = 'Delivery/Adjustment'
+    raw_df = df.reindex(columns=headers_with_state).copy()
+
+    if ref_col_name in raw_df.columns:
+        raw_df['_ref_num'] = pd.to_numeric(
+            raw_df[ref_col_name].astype(str).str.extract(r'(\d+)')[0], errors='coerce')
+        raw_df = raw_df.sort_values('_ref_num', kind='stable',
+                                    na_position='last').reset_index(drop=True)
+        dup_flags = (raw_df['_ref_num'].notna()
+                     & raw_df['_ref_num'].duplicated(keep=False)).tolist()
+        ref_col_idx = headers_with_state.index(ref_col_name) + 1
+    else:
+        raw_df['_ref_num'] = None
+        dup_flags = [False] * len(raw_df)
+        ref_col_idx = None
+
+    dup_fill = PatternFill('solid', start_color='FFE699')  # amber = repeated 1800xxxxx
+
+    # Header row
     for col, header in enumerate(headers_with_state, 1):
         cell = ws_raw.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True, color='FFFFFF')
         cell.fill = PatternFill('solid', start_color=HEADER_COLOR)
-    for row_idx, (_, row) in enumerate(df.reindex(columns=headers_with_state).iterrows(), 2):
-        for col_idx, val in enumerate(row, 1):
-            ws_raw.cell(row=row_idx, column=col_idx, value=val)
+
+    # Data rows (sorted by reference; rows with a repeated reference are highlighted)
+    for pos, (_, row) in enumerate(raw_df.iterrows()):
+        row_idx  = pos + 2
+        ref_num  = row['_ref_num']
+        is_dup   = dup_flags[pos]
+        for col_idx, header in enumerate(headers_with_state, 1):
+            val = row[header]
+            if col_idx == ref_col_idx and pd.notna(ref_num):
+                val = int(ref_num)           # write the reference as a real number
+            cell = ws_raw.cell(row=row_idx, column=col_idx, value=val)
+            if is_dup:
+                cell.fill = dup_fill
+
     # Grand total across all lines
-    raw_total_row = len(df) + 2
+    raw_total_row = len(raw_df) + 2
     raw_total_col = headers_with_state.index('Total (AUD)') + 1
     raw_gst_col   = headers_with_state.index('GST (AUD)') + 1
     ws_raw.cell(row=raw_total_row, column=1, value='TOTAL').font = Font(bold=True)
@@ -339,10 +373,432 @@ def build_excel(df, client_total):
                 value=f'=SUM({get_column_letter(raw_gst_col)}2:{get_column_letter(raw_gst_col)}{raw_total_row-1})'
                 ).font = Font(bold=True)
 
+
+def build_excel(df, client_total):
+    """Build the split Excel (Tab 1): per-state sheets plus Summary and raw_data."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    _populate_split_sheets(wb, df, client_total)
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
     return buffer
+
+# ════════════════════════════════════════════════════════════════════════════
+# MASTER CONSOLIDATION HELPERS  (Tab 4)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Original .TXT column order — used when writing a re-uploadable master_file.txt.
+TXT_COLUMNS = [
+    'Vendor', 'Name', 'Truck', 'Origin', 'Date', 'Shipment',
+    'Delivery/Adjustment', 'Customer Name & Address', 'Zone',
+    'Abnormal Item Description', 'Load Qty', 'Paid Qty', 'UOM', 'Rate',
+    'Freight', 'LEVY', 'Incidental (AUD)', 'Adjustment/Net (AUD)',
+    'Total (AUD)', 'GST (AUD)'
+]
+
+# Numeric fields summed when consolidating per 1800 number.
+CONSOL_NUM_COLS = ['Load Qty', 'Paid Qty', 'Rate', 'Freight', 'LEVY',
+                   'Incidental (AUD)', 'Adjustment/Net (AUD)',
+                   'Total (AUD)', 'GST (AUD)']
+
+# ── Sell Fuel Surcharge (hardcoded from the client's fuel table) ──────────────
+# Effective-date based: each rate applies from its date until the next one starts.
+# The base rate applies to any shipment dated before the earliest effective date.
+SELL_FSC_EFFECTIVE = [
+    {'from': '22.03.2026', 'pct': 37.0},
+    {'from': '04.05.2026', 'pct': 33.0},
+    {'from': '11.05.2026', 'pct': 31.0},
+    {'from': '18.05.2026', 'pct': 29.0},
+]
+SELL_FSC_BASE_PCT = 15.0   # the blank-date row — applies before 22.03.2026
+
+
+def sell_fsc_for_date(date_obj):
+    """Return the SELL fuel-surcharge fraction for a shipment date (effective-date
+    based). Falls back to the base rate for dates before the earliest effective date."""
+    pct = SELL_FSC_BASE_PCT
+    if date_obj is not None:
+        eff = sorted(((_parse_date(e['from']), e['pct']) for e in SELL_FSC_EFFECTIVE),
+                     key=lambda x: (x[0] is None, x[0]))
+        for d, p in eff:
+            if d and date_obj >= d:
+                pct = p
+            else:
+                break
+    return pct / 100.0
+
+
+def get_sell_fsc_df():
+    """Read-only table of the hardcoded sell FSC for display on the tab."""
+    rows = [{'Effective from': '(before 22.03.2026)', 'FSC %': SELL_FSC_BASE_PCT}]
+    for e in SELL_FSC_EFFECTIVE:
+        rows.append({'Effective from': e['from'], 'FSC %': e['pct']})
+    return pd.DataFrame(rows)
+
+
+def _machship_date(s):
+    """Parse Machship dates like '20/May/2026' (and common fallbacks)."""
+    for fmt in ('%d/%b/%Y', '%d/%B/%Y', '%d/%m/%Y', '%Y-%m-%d', '%d.%m.%Y', '%m/%d/%Y'):
+        try:
+            return datetime.strptime(str(s).strip()[:11], fmt).date()
+        except Exception:
+            pass
+    return None
+
+
+def compute_rate_card_expected(df_csv, rate_card, ref_col='Reference 1'):
+    """Independently price each shipment from the rate card — the 'what we should
+    have billed' figure. Priced off the Machship extract (clean pallet count / lane /
+    despatch date), NOT the client txt (whose fuel-levy adjustment lines don't follow
+    the band). For an intra-state METRO shipment: expected sell (ex GST) =
+    band_rate(pallets) x pallets x (1 + sell-FSC(despatch date)). Interstate / regional
+    / non-metro shipments can't be auto-priced → that reference is 'Manual'.
+    Aggregated per 1800 reference."""
+    empty = pd.DataFrame(columns=['Ref', 'Rate Card Expected (ex GST)', 'RC Coverage'])
+    if df_csv is None or df_csv.empty or not rate_card or ref_col not in df_csv.columns:
+        return empty
+    band = rate_card.get('metro_band') or [60, 35, 30, 25]
+    items_col = next((c for c in ['# of Items', 'Items', 'Quantity', 'Qty'] if c in df_csv.columns), None)
+    fz = 'From Zone' if 'From Zone' in df_csv.columns else None
+    tz = 'To Zone'   if 'To Zone'   in df_csv.columns else None
+    dc = next((c for c in ['Despatch Date', 'Created Date', 'Completed/ETA Date'] if c in df_csv.columns), None)
+
+    recs = []
+    for _, r in df_csv.iterrows():
+        m = re.findall(r'1800\d+', str(r.get(ref_col, '')))
+        if not m:
+            continue
+        fzone = str(r.get(fz, '')).upper() if fz else ''
+        tzone = str(r.get(tz, '')).upper() if tz else ''
+        items = clean_number(r.get(items_col, 0)) if items_col else 0
+        is_metro = ('METRO' in fzone and 'METRO' in tzone)      # intra-state metro lane
+        if is_metro and items > 0:
+            fsc = sell_fsc_for_date(_machship_date(r.get(dc)) if dc else None)
+            exp = round(_band_rate(items, band) * items * (1 + fsc), 2)
+            recs.append({'Ref': int(m[0]), 'exp': exp, 'ok': True})
+        else:
+            recs.append({'Ref': int(m[0]), 'exp': 0.0, 'ok': False})
+    if not recs:
+        return empty
+    d = pd.DataFrame(recs)
+    out = []
+    for ref, grp in d.groupby('Ref'):
+        if grp['ok'].all():
+            out.append({'Ref': ref,
+                        'Rate Card Expected (ex GST)': round(grp['exp'].sum(), 2),
+                        'RC Coverage': 'Auto (metro pallet)'})
+        else:
+            out.append({'Ref': ref, 'Rate Card Expected (ex GST)': None,
+                        'RC Coverage': 'Manual (regional/interstate/non-metro)'})
+    return pd.DataFrame(out)
+
+
+def parse_multiple_txt(uploaded_files):
+    """Parse several client statement .TXT files (each with its own trailing
+    summary row, e.g. a master_file.txt plus new invoices) and return
+    (combined_df, summed_client_total, per_file_info)."""
+    frames, total, info = [], 0.0, []
+    for f in uploaded_files:
+        try:
+            try: f.seek(0)          # Streamlit re-runs the script; reset the pointer
+            except Exception: pass
+            df, ct = parse_txt(f)
+            frames.append(df.copy())
+            total += ct
+            info.append({'File': getattr(f, 'name', 'uploaded.txt'),
+                         'Lines': len(df), 'Statement Total (AUD)': round(ct, 2)})
+        except Exception as e:
+            st.warning(f"⚠ Could not parse {getattr(f, 'name', 'a .TXT')}: {e}")
+    if not frames:
+        return pd.DataFrame(), 0.0, []
+    combined = pd.concat(frames, ignore_index=True)
+    return combined, round(total, 2), info
+
+
+def consolidate_by_ref(df):
+    """Group every invoice line by the 1800 reference (Delivery/Adjustment) and
+    sum the money / quantity columns, so charges and credits net off into one
+    final figure per shipment."""
+    if df.empty:
+        return pd.DataFrame(columns=['Ref', 'State', 'Customer', 'Lines'] +
+                            CONSOL_NUM_COLS + ['Final Total (inc GST)'])
+    d = df.copy()
+    d['Ref'] = pd.to_numeric(
+        d['Delivery/Adjustment'].astype(str).str.extract(r'(\d+)')[0], errors='coerce')
+    for c in CONSOL_NUM_COLS:
+        d[c] = d[c].apply(clean_number) if c in d.columns else 0.0
+
+    g       = d.groupby('Ref', dropna=False)
+    grouped = g[CONSOL_NUM_COLS].sum()
+    lines   = g.size().rename('Lines')
+    state   = g['State'].agg(
+        lambda s: s.dropna().iloc[0] if s.notna().any() else 'TBC').rename('State')
+    cust    = g['Customer Name & Address'].agg(
+        lambda s: s.dropna().astype(str).iloc[0] if s.notna().any() else '').rename('Customer')
+
+    out = pd.concat([lines, state, cust, grouped], axis=1).reset_index()
+    out['Final Total (inc GST)'] = out['Total (AUD)'] + out['GST (AUD)']
+    for c in CONSOL_NUM_COLS + ['Final Total (inc GST)']:
+        out[c] = out[c].round(2)
+    out = out.sort_values('Ref', na_position='last').reset_index(drop=True)
+    cols = ['Ref', 'State', 'Customer', 'Lines'] + CONSOL_NUM_COLS + ['Final Total (inc GST)']
+    return out[cols]
+
+
+def detect_ref_column(df_csv):
+    """Best-guess which Machship CSV column holds the 1800 reference."""
+    for p in ['Reference 1', 'Reference', 'Ref 1', 'Ref',
+              'Customer Reference', 'Con Note', 'Connote']:
+        if p in df_csv.columns:
+            return p
+    best, best_hits = None, 0
+    for c in df_csv.columns:
+        hits = df_csv[c].astype(str).str.contains(r'1800\d{4,}', regex=True, na=False).sum()
+        if hits > best_hits:
+            best, best_hits = c, hits
+    return best if best_hits else (df_csv.columns[0] if len(df_csv.columns) else None)
+
+
+def detect_sell_column(df_csv):
+    """Best-guess the Machship 'sell' (ex GST) amount column. 'Sell Ex Tax' is the
+    real ex-GST sell in the Machship export (Base Sell + Fuel Sell); 'Total Sell'
+    is inc GST, so it's only a last-resort fallback."""
+    for p in ['Sell Ex Tax', 'Total Sell Ex GST', 'Sell Ex GST', 'Sell (Ex GST)',
+              'Rate Charge and Fuel Levy', 'Total Sell', 'Sell', 'Total']:
+        if p in df_csv.columns:
+            return p
+    return None
+
+
+def machship_by_ref(df_csv, ref_col, sell_col):
+    """Sum the Machship sell amount (ex GST) per 1800 reference.
+    Returns columns: Ref, Machship Sell (ex GST), Machship Rows."""
+    empty = pd.DataFrame(columns=['Ref', 'Machship Sell (ex GST)', 'Machship Rows'])
+    if df_csv is None or df_csv.empty or not ref_col or not sell_col:
+        return empty
+    rows = []
+    for _, r in df_csv.iterrows():
+        refs = re.findall(r'1800\d+', str(r.get(ref_col, '')))
+        if not refs:
+            continue
+        rows.append({'Ref': int(refs[0]), 'Sell': clean_number(r.get(sell_col, 0))})
+    if not rows:
+        return empty
+    md = pd.DataFrame(rows)
+    out = md.groupby('Ref').agg(
+        **{'Machship Sell (ex GST)': ('Sell', 'sum'),
+           'Machship Rows': ('Sell', 'size')}).reset_index()
+    out['Machship Sell (ex GST)'] = out['Machship Sell (ex GST)'].round(2)
+    return out
+
+
+def build_discrepancy(consol_df, mship_df, rc_df=None):
+    """Per 1800 reference: client paid (Total AUD ex GST) vs Machship sell (ex GST),
+    and — when a rate card is supplied — the rate-card 'should have billed' (ex GST)
+    as the source of truth. Status reflects client vs Machship."""
+    client_refs = set(consol_df['Ref']) if not consol_df.empty else set()
+    mship_refs  = set(mship_df['Ref'])  if not mship_df.empty  else set()
+    if not client_refs and not mship_refs:
+        return pd.DataFrame()
+
+    left = (consol_df[['Ref', 'State', 'Customer', 'Total (AUD)']]
+            .rename(columns={'Total (AUD)': 'Client Paid (ex GST)'})
+            if not consol_df.empty else
+            pd.DataFrame(columns=['Ref', 'State', 'Customer', 'Client Paid (ex GST)']))
+    right = mship_df if not mship_df.empty else \
+            pd.DataFrame(columns=['Ref', 'Machship Sell (ex GST)', 'Machship Rows'])
+
+    m = left.merge(right, on='Ref', how='outer')
+    m['Client Paid (ex GST)']   = m['Client Paid (ex GST)'].fillna(0).round(2)
+    m['Machship Sell (ex GST)'] = m['Machship Sell (ex GST)'].fillna(0).round(2)
+    m['Machship Rows']          = m['Machship Rows'].fillna(0).astype(int)
+    m['State']    = m['State'].fillna('TBC')
+    m['Customer'] = m['Customer'].fillna('')
+    m['Difference (Client - Machship)'] = (m['Client Paid (ex GST)']
+                                           - m['Machship Sell (ex GST)']).round(2)
+
+    def status(ref, diff):
+        inc, inm = ref in client_refs, ref in mship_refs
+        if inc and not inm: return '⚠ No Machship data'
+        if inm and not inc: return '⚠ No client line'
+        if abs(diff) <= 0.01: return '✓ Match'
+        return '❌ Discrepancy'
+    m['Status'] = [status(ref, diff) for ref, diff
+                   in zip(m['Ref'], m['Difference (Client - Machship)'])]
+
+    cols = ['Ref', 'State', 'Customer', 'Client Paid (ex GST)', 'Machship Sell (ex GST)',
+            'Difference (Client - Machship)', 'Machship Rows', 'Status']
+
+    # Rate card = independent source of truth (when supplied)
+    if rc_df is not None and not rc_df.empty:
+        m = m.merge(rc_df, on='Ref', how='left')
+        m['RC Coverage'] = m['RC Coverage'].fillna('Manual (regional/interstate/tonne)')
+        m['Machship vs Rate Card'] = (m['Machship Sell (ex GST)']
+                                      - m['Rate Card Expected (ex GST)']).round(2)
+        m['Client vs Rate Card'] = (m['Client Paid (ex GST)']
+                                    - m['Rate Card Expected (ex GST)']).round(2)
+        cols = ['Ref', 'State', 'Customer', 'Client Paid (ex GST)', 'Machship Sell (ex GST)',
+                'Rate Card Expected (ex GST)', 'Difference (Client - Machship)',
+                'Machship vs Rate Card', 'Client vs Rate Card', 'RC Coverage',
+                'Machship Rows', 'Status']
+
+    m = m.sort_values('Ref', na_position='last').reset_index(drop=True)
+    return m[[c for c in cols if c in m.columns]]
+
+
+def build_state_comparison(consol_df, mship_df, rc_df=None):
+    """Per state: 'We Thought' = Machship sell (ex GST) vs 'Their Figure' = client
+    Total (AUD) ex GST, plus (when supplied) 'Rate Card Should Be' = rate-card
+    expected (ex GST). Machship / rate-card refs are attributed to the state of the
+    matching client line; Machship refs with no client line fall under 'Unmatched'."""
+    if not consol_df.empty:
+        client    = consol_df.groupby('State')['Total (AUD)'].sum().rename('Their Figure (ex GST)')
+        ref_state = dict(zip(consol_df['Ref'], consol_df['State']))
+    else:
+        client, ref_state = pd.Series(dtype=float, name='Their Figure (ex GST)'), {}
+
+    if not mship_df.empty:
+        tmp = mship_df.copy()
+        tmp['State'] = tmp['Ref'].map(ref_state).fillna('Unmatched')
+        mship = tmp.groupby('State')['Machship Sell (ex GST)'].sum().rename('We Thought (ex GST)')
+    else:
+        mship = pd.Series(dtype=float, name='We Thought (ex GST)')
+
+    if client.empty and mship.empty:
+        return pd.DataFrame()
+
+    parts = [mship, client]
+    have_rc = rc_df is not None and not rc_df.empty
+    if have_rc:
+        tmp = rc_df.dropna(subset=['Rate Card Expected (ex GST)']).copy()
+        tmp['State'] = tmp['Ref'].map(ref_state).fillna('Unmatched')
+        rc = tmp.groupby('State')['Rate Card Expected (ex GST)'].sum().rename('Rate Card Should Be (ex GST)')
+        parts.append(rc)
+
+    out = pd.concat(parts, axis=1).fillna(0.0)
+    out['Difference (Client - Machship)'] = (out['Their Figure (ex GST)']
+                                             - out['We Thought (ex GST)']).round(2)
+    for c in ['We Thought (ex GST)', 'Their Figure (ex GST)', 'Rate Card Should Be (ex GST)']:
+        if c in out.columns:
+            out[c] = out[c].round(2)
+    out = out.reset_index().rename(columns={'index': 'State'})
+    out['_o'] = out['State'].apply(lambda s: 1 if s == 'Unmatched' else 0)
+    out = out.sort_values(['_o', 'State']).drop(columns='_o').reset_index(drop=True)
+
+    order = ['State', 'We Thought (ex GST)', 'Their Figure (ex GST)']
+    if have_rc:
+        order.append('Rate Card Should Be (ex GST)')
+    order.append('Difference (Client - Machship)')
+    return out[[c for c in order if c in out.columns]]
+
+
+def build_master_txt(df):
+    """Serialise the combined client data back to a tab-separated master_file.txt
+    (original .TXT columns + a trailing summary row) so it re-uploads cleanly and
+    keeps growing next time. The summary row's Total (AUD) holds the INC-GST grand
+    total, matching the source statements (that's the figure parse_txt reads)."""
+    out = df.reindex(columns=TXT_COLUMNS).copy()
+    ex_gst  = pd.to_numeric(out['Total (AUD)'], errors='coerce').fillna(0).sum()
+    gst     = pd.to_numeric(out['GST (AUD)'],   errors='coerce').fillna(0).sum()
+    inc_gst = round(ex_gst + gst, 2)
+    summary = {c: '' for c in TXT_COLUMNS}
+    summary['Vendor'] = 'TOTAL'
+    summary['Total (AUD)'] = inc_gst
+    out = pd.concat([out, pd.DataFrame([summary])], ignore_index=True)
+    return out.to_csv(sep='\t', index=False).encode('utf-8')
+
+
+def _py(v):
+    """Convert numpy scalars to plain Python types for openpyxl."""
+    if hasattr(v, 'item'):
+        try: return v.item()
+        except Exception: return v
+    return v
+
+
+def _write_df_sheet(ws, df, title, row_fill_fn=None, total_cols=None):
+    """Write a DataFrame to a sheet: title (row 1), header (row 2), data (row 3+),
+    optional per-row fill and an optional TOTAL row summing `total_cols`."""
+    ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=13)
+    cols = list(df.columns)
+    for c, col in enumerate(cols, 1):
+        cell = ws.cell(row=2, column=c, value=col)
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill('solid', start_color=HEADER_COLOR)
+    r = 3
+    for _, row in df.iterrows():
+        fill = row_fill_fn(row) if row_fill_fn else None
+        for c, col in enumerate(cols, 1):
+            val = _py(row[col])
+            if isinstance(val, float):
+                val = round(val, 2)
+            cell = ws.cell(row=r, column=c, value=val)
+            if fill is not None:
+                cell.fill = fill
+        r += 1
+    if total_cols:
+        ws.cell(row=r, column=1, value='TOTAL').font = Font(bold=True)
+        for c, col in enumerate(cols, 1):
+            if col in total_cols and col in df.columns:
+                tot = round(pd.to_numeric(df[col], errors='coerce').fillna(0).sum(), 2)
+                ws.cell(row=r, column=c, value=tot).font = Font(bold=True)
+    return ws
+
+
+def build_master_excel(df_all, client_total, consol_df, mship_df, disc_df, state_cmp_df):
+    """Build the master workbook: the standard split (Summary, raw_data, states)
+    plus consolidated_by_1800, discrepancies, and state_vs_machship sheets."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    _populate_split_sheets(wb, df_all, client_total)
+
+    red   = PatternFill('solid', start_color='C00000')
+    amber = PatternFill('solid', start_color='B8860B')
+    green = PatternFill('solid', start_color='1F7A1F')
+    blue  = PatternFill('solid', start_color='2F5597')
+
+    # consolidated_by_1800 — flag net-credit shipments (negative Total) in blue
+    def consol_fill(row):
+        try:
+            return blue if float(row['Total (AUD)']) < 0 else None
+        except Exception:
+            return None
+    _write_df_sheet(
+        wb.create_sheet('consolidated_by_1800'), consol_df,
+        'Consolidated cost per 1800 number (charges + credits netted)',
+        row_fill_fn=consol_fill,
+        total_cols=CONSOL_NUM_COLS + ['Final Total (inc GST)'])
+
+    # discrepancies — colour by status
+    def disc_fill(row):
+        s = row.get('Status', '')
+        if s == '❌ Discrepancy': return red
+        if s == '✓ Match':        return green
+        if isinstance(s, str) and s.startswith('⚠'): return amber
+        return None
+    if not disc_df.empty:
+        _write_df_sheet(
+            wb.create_sheet('discrepancies'), disc_df,
+            'Client paid vs Machship sell vs Rate card, per 1800 number (ex GST)',
+            row_fill_fn=disc_fill,
+            total_cols=['Client Paid (ex GST)', 'Machship Sell (ex GST)',
+                        'Rate Card Expected (ex GST)', 'Difference (Client - Machship)',
+                        'Machship vs Rate Card', 'Client vs Rate Card'])
+
+    # state_vs_machship
+    if not state_cmp_df.empty:
+        _write_df_sheet(
+            wb.create_sheet('state_vs_machship'), state_cmp_df,
+            'Per state: what we thought we make vs their figure (ex GST)',
+            total_cols=['We Thought (ex GST)', 'Their Figure (ex GST)',
+                        'Rate Card Should Be (ex GST)', 'Difference (Client - Machship)'])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # RATE-CARD RECONCILIATION HELPERS  (Tab 2)
@@ -593,7 +1049,7 @@ def reconcile_csv(df_csv, recon_txt_df):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation", "📸 Screenshot to Excel (Beta)"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation", "📸 Screenshot to Excel (Beta)", "🗂 Master Consolidation"])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1
@@ -1146,3 +1602,171 @@ with tab3:
             file_name="screenshot_charges.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Master Consolidation
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab4:
+    st.write(
+        "Upload **multiple client statement `.TXT` files** (include a previously "
+        "downloaded `master_file.txt` plus any new invoices) and **multiple Machship "
+        "`.CSV` extracts**. Everything is combined into one workbook — split by state, "
+        "consolidated per 1800 number, and compared against what Machship says we invoiced."
+    )
+    st.caption("🔒 Online build — nothing is stored. Download the master_file.txt and re-upload it "
+               "next time to keep growing it.")
+
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        master_txts = st.file_uploader(
+            "Client statements (.TXT) — master_file.txt + new invoices",
+            type=['txt', 'TXT'], key="tab4_txts", accept_multiple_files=True)
+    with mc2:
+        master_csvs = st.file_uploader(
+            "Machship extracts (.CSV) — optional, enables the comparison",
+            type=['csv', 'CSV'], key="tab4_csvs", accept_multiple_files=True)
+    with mc3:
+        master_ratecard = st.file_uploader(
+            "Sell rate card (.xlsx) — optional, source of truth",
+            type=['xlsx', 'XLSX'], key="tab4_ratecard")
+
+    if master_txts:
+        oversize = [f.name for f in master_txts if f.size > 20 * 1024 * 1024]
+        if oversize:
+            st.error(f"⚠ These files exceed the 20MB limit: {', '.join(oversize)}")
+            st.stop()
+
+        with st.spinner("Combining statements..."):
+            df_all, client_total, info = parse_multiple_txt(master_txts)
+
+        if df_all.empty:
+            st.error("No valid data found in the uploaded .TXT files.")
+            st.stop()
+
+        st.divider()
+        st.subheader("Uploaded statements")
+        st.dataframe(pd.DataFrame(info), use_container_width=True, hide_index=True)
+
+        # Exact-duplicate detection (protects against re-uploading a file already in the master)
+        dup_mask = df_all.duplicated(subset=TXT_COLUMNS, keep=False)
+        n_dup = int(dup_mask.sum())
+        if n_dup:
+            st.warning(f"⚠ {n_dup} line(s) are exact duplicates across your uploads — this happens "
+                       "if a statement already inside the master was uploaded again.")
+            if st.checkbox("Remove exact duplicate lines before consolidating", value=False,
+                           key="tab4_dedupe"):
+                before = len(df_all)
+                df_all = df_all.drop_duplicates(subset=TXT_COLUMNS, keep='first').reset_index(drop=True)
+                client_total = round(df_all['Total (AUD)'].sum(), 2)
+                st.info(f"Removed {before - len(df_all)} duplicate line(s); {len(df_all)} remain.")
+
+        # ── Machship extracts + column mapping ────────────────────────────
+        ref_col = sell_col = None
+        df_csv = pd.DataFrame()
+        if master_csvs:
+            for f in master_csvs:
+                try: f.seek(0)
+                except Exception: pass
+            df_csv = parse_consignment_csvs(master_csvs)
+            if not df_csv.empty:
+                st.divider()
+                st.subheader("Machship column mapping")
+                auto_ref, auto_sell = detect_ref_column(df_csv), detect_sell_column(df_csv)
+                opts = list(df_csv.columns)
+                colr, cols_ = st.columns(2)
+                with colr:
+                    ref_col = st.selectbox(
+                        "Reference column (contains the 1800 number)", options=opts,
+                        index=(opts.index(auto_ref) if auto_ref in opts else 0), key="tab4_refcol")
+                with cols_:
+                    sell_col = st.selectbox(
+                        "Sell amount column — ex GST (what we invoice)", options=opts,
+                        index=(opts.index(auto_sell) if auto_sell in opts else 0), key="tab4_sellcol")
+                st.caption("Pick the **ex-GST** sell/charge column so it lines up with the client's "
+                           "Total (AUD), which is also ex GST.")
+
+        # ── Rate card (optional) + hardcoded sell fuel surcharge ──────────
+        rate_card = None
+        if master_ratecard is not None:
+            try:
+                master_ratecard.seek(0)
+            except Exception:
+                pass
+            try:
+                rate_card = parse_rate_card(master_ratecard)
+                st.divider()
+                st.success(f"✓ Rate card loaded (this session only) — effective "
+                           f"{rate_card.get('effective', '?')}, metro pallet bands "
+                           f"{rate_card.get('metro_band')}.")
+            except Exception as e:
+                st.error(f"⚠ Could not parse rate card: {e}")
+                rate_card = None
+
+        with st.expander("⛽ Sell Fuel Surcharge (hardcoded — no upload needed)", expanded=False):
+            st.caption("Applied to the rate-card 'should have billed' figure, by each line's date. "
+                       "Edit `SELL_FSC_EFFECTIVE` / `SELL_FSC_BASE_PCT` at the top of the file to change it.")
+            st.dataframe(get_sell_fsc_df(), use_container_width=True, hide_index=True)
+
+        # ── Build consolidation + comparisons ─────────────────────────────
+        consol_df = consolidate_by_ref(df_all)
+        mship_df  = (machship_by_ref(df_csv, ref_col, sell_col)
+                     if not df_csv.empty else
+                     pd.DataFrame(columns=['Ref', 'Machship Sell (ex GST)', 'Machship Rows']))
+        rc_df     = (compute_rate_card_expected(df_csv, rate_card, ref_col)
+                     if (rate_card and not df_csv.empty and ref_col) else None)
+        disc_df   = build_discrepancy(consol_df, mship_df, rc_df)
+        state_cmp = build_state_comparison(consol_df, mship_df, rc_df)
+
+        # ── Metrics ───────────────────────────────────────────────────────
+        st.divider()
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Statements", len(info))
+        k2.metric("Invoice lines", len(df_all))
+        k3.metric("Unique 1800 refs", len(consol_df))
+        k4.metric("Client total (ex GST)", f"${df_all['Total (AUD)'].sum():,.2f}")
+
+        # ── Per-state comparison ──────────────────────────────────────────
+        st.divider()
+        st.subheader("Per state — what we thought we make vs their figure (ex GST)")
+        st.caption("'We Thought' = Machship sell (ex GST). 'Their Figure' = consolidated client Total (AUD), ex GST.")
+        st.dataframe(state_cmp if not state_cmp.empty else pd.DataFrame({'info': ['Upload Machship CSV(s) to compare']}),
+                     use_container_width=True, hide_index=True)
+
+        # ── Discrepancies ─────────────────────────────────────────────────
+        if not disc_df.empty and not mship_df.empty:
+            st.divider()
+            st.subheader("Discrepancies per 1800 number (ex GST)")
+            n_mis = int((disc_df['Status'] == '❌ Discrepancy').sum())
+            n_noms = int((disc_df['Status'] == '⚠ No Machship data').sum())
+            n_nocl = int((disc_df['Status'] == '⚠ No client line').sum())
+            st.caption(f"{n_mis} mismatch(es) · {n_noms} client-only (no Machship) · {n_nocl} Machship-only (no client line).")
+            st.dataframe(disc_df, use_container_width=True, hide_index=True)
+        elif master_csvs:
+            st.info("Choose a valid Machship reference and ex-GST sell column above to see the comparison.")
+        else:
+            st.info("Add Machship CSV extract(s) to compare their figures against what we invoiced.")
+
+        # ── Consolidated per 1800 ─────────────────────────────────────────
+        st.divider()
+        st.subheader("Consolidated cost per 1800 number")
+        st.caption("Charges and credits (negative costs) net off within each 1800 number to give the final cost paid.")
+        st.dataframe(consol_df, use_container_width=True, hide_index=True)
+
+        # ── Downloads ─────────────────────────────────────────────────────
+        st.divider()
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "⬇️ Download master_file.txt (re-upload next time)",
+                data=build_master_txt(df_all),
+                file_name="master_file.txt", mime="text/plain")
+            st.caption("Combined client data + trailing total, in the original .TXT format.")
+        with d2:
+            xbuf = build_master_excel(df_all, client_total, consol_df, mship_df, disc_df, state_cmp)
+            st.download_button(
+                "⬇️ Download master workbook (.xlsx)",
+                data=xbuf, file_name="master_consolidated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.caption("Summary, raw_data, per-state, consolidated_by_1800, discrepancies, state_vs_machship.")
