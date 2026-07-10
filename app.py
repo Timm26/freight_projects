@@ -64,17 +64,11 @@ def clean_number(val):
         return 0.0
 
 def get_state(row):
-    """Derive the delivery state from the Zone code.
+    """Derive the delivery state from the Zone code (destination only).
 
-    Zone format is Y<state-letter><location>, e.g. YNSYDMETRO, YVMELMETRO.
-      • Any *SYDMETRO zone            -> 'NSW'  (Sydney metro folded into NSW)
-      • NSW or VIC zones              -> 'NSW' / 'VIC'
-      • Everything else (other states,
-        blank or unrecognised zones)  -> 'TBC'
-
-    The Origin column is deliberately NOT used: it contains warehouse and
-    free-text notes (e.g. 'MERGED SHIPMENT', 'ex 6722 Rohlig NSW ...') that
-    caused false matches such as NT (from "shipmeNT") and QLD.
+    Superseded by assign_states() for the actual split — assign_states() adds an
+    Origin fallback and 1800-reference matching that this row-only function can't
+    do. Kept for any single-row callers.
     """
     zone = str(row.get('Zone', '')).strip().upper()
     if not zone or zone == 'NAN':
@@ -84,6 +78,70 @@ def get_state(row):
     letter = zone[1] if len(zone) >= 2 and zone[0] == 'Y' else ''
     state  = ZONE_LETTER_STATE.get(letter)
     return state if state in VALID_STATES else 'TBC'
+def _state_from_zone(zone):
+    """Destination state from the Zone code (NSW/VIC only), else None.
+    Y<letter><location>, *SYDMETRO folded into NSW."""
+    z = str(zone).strip().upper()
+    if not z or z == 'NAN':
+        return None
+    if 'SYDMETRO' in z:
+        return 'NSW'
+    letter = z[1] if len(z) >= 2 and z[0] == 'Y' else ''
+    s = ZONE_LETTER_STATE.get(letter)
+    return s if s in VALID_STATES else None
+
+
+def _state_from_origin(origin):
+    """State from the Origin free-text — ONLY the two valid buckets (NSW/VIC),
+    matched on word boundaries so notes like 'MERGED SHIPMENT' (…meNT) or other
+    states can't false-match."""
+    o = str(origin).upper()
+    for s in ('NSW', 'VIC'):
+        if re.search(r'\b' + s + r'\b', o):
+            return s
+    return None
+
+
+def assign_states(df):
+    """Resolve the state for every row, in priority order:
+      1) Zone code (destination state)
+      2) Origin text (NSW / VIC warehouse) — for rows the Zone can't place
+      3) another line sharing the same 1800 Delivery/Adjustment reference
+         (e.g. a 'FUEL LEVY ERROR' adjustment inherits the state of the real
+         shipment line with the same 1800 number)
+      4) otherwise 'TBC'
+    Returns a State Series aligned to df.index. Works across the whole frame,
+    so ref-matching also resolves lines whose partner is in another file."""
+    n = len(df)
+    idx = df.index
+    if n == 0:
+        return pd.Series([], dtype=object)
+
+    zone_ser   = df['Zone']                if 'Zone'                in df.columns else pd.Series([''] * n, index=idx)
+    origin_ser = df['Origin']              if 'Origin'              in df.columns else pd.Series([''] * n, index=idx)
+    da_ser     = df['Delivery/Adjustment'] if 'Delivery/Adjustment' in df.columns else pd.Series([''] * n, index=idx)
+
+    # Pass 1 (zone) then Pass 2 (origin)
+    resolved, refs_list = [], []
+    for z, o, da in zip(zone_ser, origin_ser, da_ser):
+        resolved.append(_state_from_zone(z) or _state_from_origin(o))
+        refs_list.append(extract_all_refs(da))
+
+    # Build 1800-ref -> state from rows already placed in a valid state
+    ref_to_state = {}
+    for s, refs in zip(resolved, refs_list):
+        if s in VALID_STATES:
+            for r in refs:
+                ref_to_state.setdefault(r, s)
+
+    # Pass 3: fill the rest by matching the 1800 reference; else TBC
+    final = []
+    for s, refs in zip(resolved, refs_list):
+        if s in VALID_STATES:
+            final.append(s)
+        else:
+            final.append(next((ref_to_state[r] for r in refs if r in ref_to_state), 'TBC'))
+    return pd.Series(final, index=idx)
 
 def split_customer_refs(ref_str):
     parts = re.split(r'[,&]+', str(ref_str))
@@ -114,7 +172,7 @@ def parse_txt(uploaded_file):
     for col in ['Total (AUD)', 'GST (AUD)', 'Freight', 'LEVY', 'Load Qty', 'Paid Qty']:
         df[col] = df[col].apply(clean_number)
     df['Final Total'] = df['Total (AUD)'] + df['GST (AUD)']
-    df['State']       = df.apply(get_state, axis=1)
+    df['State']       = assign_states(df)
     client_total      = clean_number(summary_row_data['Total (AUD)'])
     return df, client_total
 
@@ -513,6 +571,9 @@ def parse_multiple_txt(uploaded_files):
     if not frames:
         return pd.DataFrame(), 0.0, []
     combined = pd.concat(frames, ignore_index=True)
+    # Re-resolve states across the COMBINED set so a 'FUEL LEVY ERROR' style line in
+    # one file can inherit the state of its matching 1800 shipment line in another.
+    combined['State'] = assign_states(combined)
     return combined, round(total, 2), info
 
 
@@ -799,7 +860,6 @@ def build_master_excel(df_all, client_total, consol_df, mship_df, disc_df, state
     buf.seek(0)
     return buf
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # RATE-CARD RECONCILIATION HELPERS  (Tab 2)
 # ════════════════════════════════════════════════════════════════════════════
@@ -1013,37 +1073,47 @@ def reconcile_txt(df_txt, rate_card, fsc_df, default_fsc=None):
 
 def reconcile_csv(df_csv, recon_txt_df):
     """
-    Compare Machship CSV 'Total Sell' against the rate-card expected total
-    (from the auto-checked TXT lines), matched by 1800xxxxxx delivery ref.
+    Compare Machship CSV 'Total Sell' against the rate-card expected total — but ONLY
+    for shipments that are on the invoice (i.e. whose delivery ref appears on a TXT line).
+    CSV rows not on the invoice are ignored entirely.
     """
     if df_csv.empty:
         return pd.DataFrame()
 
-    # Map delivery ref → expected total from TXT reconciliation (auto lines only)
+    # 1) Invoice delivery refs — every ref that appears on a TXT line (the invoice).
+    invoice_refs = set()
+    for _, r in recon_txt_df.iterrows():
+        ref = str(r.get('Delivery/Adjustment', '')).strip()
+        if ref:
+            invoice_refs.add(ref)
+
+    # 2) Expected total per ref (only auto-checked metro lines have one).
     exp_by_ref = {}
     for _, r in recon_txt_df.iterrows():
         ref = str(r.get('Delivery/Adjustment', '')).strip()
-        if r.get('Expected Total') is not None:
+        if ref and pd.notna(r.get('Expected Total')):
             exp_by_ref[ref] = r['Expected Total']
 
     rows = []
     for _, row in df_csv.iterrows():
         refs = re.findall(r'1800\d+', str(row.get('Reference 1', '')))
+        # Only keep CSV rows that belong to the invoice.
+        invoice_match = next((ref for ref in refs if ref in invoice_refs), None)
+        if invoice_match is None:
+            continue
+
         total_sell = clean_number(row.get('Total Sell', 0))
-        matched_exp = None
-        matched_ref = None
-        for ref in refs:
-            if ref in exp_by_ref:
-                matched_exp = exp_by_ref[ref]; matched_ref = ref; break
+        matched_exp = next((exp_by_ref[ref] for ref in refs if ref in exp_by_ref), None)
+        has_exp = matched_exp is not None and pd.notna(matched_exp)
         rows.append({
             'Machship #': row.get('Machship #'),
             'Reference 1': row.get('Reference 1'),
             'To Name': row.get('To Name'),
             'CSV Total Sell': round(total_sell, 2),
-            'Rate Card Expected': matched_exp,
-            'Diff': round(total_sell - matched_exp, 2) if matched_exp is not None else None,
-            'Status': ('—' if matched_exp is None
-                       else ('✓ OK' if abs(total_sell - matched_exp) <= 0.01 else '❌ Mismatch')),
+            'Rate Card Expected': round(matched_exp, 2) if has_exp else None,
+            'Diff': round(total_sell - matched_exp, 2) if has_exp else None,
+            'Status': ('✓ OK' if (has_exp and abs(total_sell - matched_exp) <= 0.01)
+                       else ('❌ Mismatch' if has_exp else '🔍 Manual review')),
         })
     return pd.DataFrame(rows)
 
@@ -1375,17 +1445,20 @@ with tab2:
             matched_csv = csv_recon_df[csv_recon_df['Rate Card Expected'].notna()]
             csv_mism = matched_csv[matched_csv['Status'] == '❌ Mismatch']
             cm1, cm2, cm3 = st.columns(3)
-            cm1.metric("CSV rows", len(csv_recon_df))
-            cm2.metric("Matched to rate card", len(matched_csv))
+            cm1.metric("Invoice shipments in CSV", len(csv_recon_df))
+            cm2.metric("Comparable to rate card", len(matched_csv))
             cm3.metric("Mismatches", len(csv_mism))
-            st.caption("Compares CSV 'Total Sell' to the rate-card expected total (auto lines). Mismatches highlighted red.")
+            st.caption("Only shipments on the invoice (.TXT) are shown. Compares CSV 'Total Sell' to the rate-card expected total; rate-card lines (auto metro) are comparable, interstate/regional show 🔍. Mismatches highlighted red.")
 
             def style_csv(df):
                 styles = pd.DataFrame('', index=df.index, columns=df.columns)
                 for i in range(len(df)):
-                    if df.iloc[i]['Status'] == '❌ Mismatch':
+                    s = df.iloc[i]['Status']
+                    if s == '❌ Mismatch':
                         styles.iloc[i, :] = 'background-color: #4a1a1a; color: #ffb3b3'
-                    elif df.iloc[i]['Status'] == '✓ OK':
+                    elif s == '🔍 Manual review':
+                        styles.iloc[i, :] = 'background-color: #3a3320; color: #e0d4a8'
+                    elif s == '✓ OK':
                         styles.iloc[i, :] = 'background-color: #14241a; color: #a8d4b4'
                 return styles
 
@@ -1434,7 +1507,6 @@ with tab2:
             file_name="rate_card_reconciliation.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Screenshot to Excel (free OCR via pytesseract)
@@ -1602,7 +1674,6 @@ with tab3:
             file_name="screenshot_charges.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Master Consolidation
