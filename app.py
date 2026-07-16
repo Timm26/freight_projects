@@ -16,16 +16,127 @@ st.set_page_config(
     layout="wide"
 )
 
-hide_menu = """
+# ── Theme: bright, modern, friendly ───────────────────────────────────────────
+friendly_theme = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap');
+
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
+
+/* ---- Base ---- */
+.stApp {
+    background: linear-gradient(160deg, #eef4ff 0%, #f4eeff 42%, #fdeff4 72%, #fff3ec 100%);
+    background-attachment: fixed;
+    color: #3b4256;
+}
+html, body, [class*="css"], button, input, textarea, select {
+    font-family: 'Nunito', 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+.block-container { padding-top: 1.4rem; padding-left: 2.2rem; padding-right: 2.2rem; }
+h1, h2, h3 { color: #2b2350; font-weight: 800; letter-spacing: -0.4px; }
+[data-testid="stMarkdownContainer"] p, label, li { color: #4a5169; }
+
+/* ---- Hero banner ---- */
+.app-hero {
+    display: flex; align-items: center; gap: 18px;
+    background: #ffffff; border: 1px solid #efe9ff; border-radius: 22px;
+    padding: 20px 26px; margin-bottom: 20px;
+    box-shadow: 0 10px 30px rgba(124,108,246,.12);
+}
+.app-hero .emoji {
+    font-size: 30px; line-height: 1; flex: 0 0 58px; width: 58px; height: 58px;
+    display: flex; align-items: center; justify-content: center; border-radius: 18px;
+    background: linear-gradient(135deg, #7c6cf6 0%, #b06bf0 55%, #ff85b3 100%);
+    box-shadow: 0 6px 16px rgba(160,90,230,.35);
+}
+.app-hero .title {
+    font-size: 26px; font-weight: 900; letter-spacing: -0.6px; line-height: 1.1;
+    background: linear-gradient(135deg, #6d5cf0 0%, #b06bf0 55%, #ff6fa5 100%);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.app-hero .sub { color: #6b7189; font-size: 14.5px; font-weight: 700; margin-top: 3px; }
+
+/* ---- Tabs ---- */
+.stTabs [data-baseweb="tab-list"] { gap: 8px; background: transparent; border-bottom: none; flex-wrap: wrap; }
+.stTabs [data-baseweb="tab"] {
+    background: #ffffffcc; border-radius: 14px; padding: 9px 16px;
+    border: 1px solid #ece7fb; font-weight: 700; color: #6a6f86;
+    box-shadow: 0 1px 2px rgba(40,30,90,.05); transition: all .12s ease;
+}
+.stTabs [data-baseweb="tab"]:hover { transform: translateY(-1px); color: #5b4fe0; border-color: #d9d0fb; }
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(135deg, #7c6cf6 0%, #a86bef 100%);
+    color: #ffffff !important; border: 1px solid transparent;
+    box-shadow: 0 6px 16px rgba(124,108,246,.38);
+}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { background: transparent; }
+
+/* ---- Buttons ---- */
+.stDownloadButton button, .stButton button {
+    background: linear-gradient(135deg, #7c6cf6 0%, #b06bf0 100%);
+    color: #ffffff; border: none; border-radius: 13px;
+    padding: .58rem 1.2rem; font-weight: 800; letter-spacing: .2px;
+    box-shadow: 0 6px 16px rgba(124,108,246,.32);
+    transition: filter .12s ease, transform .06s ease, box-shadow .12s ease;
+}
+.stDownloadButton button:hover, .stButton button:hover {
+    filter: brightness(1.05); transform: translateY(-1px);
+    box-shadow: 0 10px 22px rgba(124,108,246,.42);
+}
+
+/* ---- Metric cards ---- */
+[data-testid="stMetric"] {
+    background: #ffffff; border: 1px solid #efe9ff; border-radius: 18px;
+    padding: 16px 20px; box-shadow: 0 6px 18px rgba(124,108,246,.10);
+}
+[data-testid="stMetricValue"] { color: #2b2350; font-weight: 900; }
+[data-testid="stMetricLabel"] { color: #8a8fa6; font-weight: 700; }
+
+/* ---- File uploader ---- */
+[data-testid="stFileUploader"] { background: transparent; }
+[data-testid="stFileUploader"] section {
+    border: 2px dashed #cbb8fb; border-radius: 18px;
+    background: linear-gradient(180deg, #fbf9ff 0%, #fff6fb 100%);
+    transition: all .12s ease;
+}
+[data-testid="stFileUploader"] section:hover { border-color: #a78bfa; background: #fbf7ff; }
+
+/* ---- Inputs / selects ---- */
+[data-baseweb="select"] > div, .stNumberInput input, .stTextInput input { border-radius: 12px !important; }
+
+/* ---- Dataframes ---- */
+[data-testid="stDataFrame"] {
+    border-radius: 16px; overflow: hidden; border: 1px solid #efe9ff;
+    box-shadow: 0 6px 18px rgba(124,108,246,.10);
+}
+
+/* ---- Expanders ---- */
+[data-testid="stExpander"] {
+    border: 1px solid #efe9ff; border-radius: 16px; background: #ffffffcc;
+    box-shadow: 0 4px 14px rgba(124,108,246,.08); overflow: hidden;
+}
+
+/* ---- Alerts + dividers ---- */
+[data-testid="stAlert"] { border-radius: 14px; border: none; font-weight: 700; }
+hr { border-color: #ece7fb; }
 </style>
 """
-st.markdown(hide_menu, unsafe_allow_html=True)
+st.markdown(friendly_theme, unsafe_allow_html=True)
 
-st.title("🚛 Data Processing Toolbox")
+st.markdown(
+    '''
+    <div class="app-hero">
+        <div class="emoji">🚛</div>
+        <div>
+            <div class="title">Data Processing Toolbox</div>
+            <div class="sub">Split, reconcile &amp; map your freight data — all in one friendly workspace.</div>
+        </div>
+    </div>
+    ''',
+    unsafe_allow_html=True
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -45,7 +156,7 @@ ZONE_LETTER_STATE = {
 # of these is routed to a "TBC" review sheet.
 VALID_STATES = {'NSW', 'VIC'}
 
-HEADER_COLOR = '1F4E79'
+HEADER_COLOR = '2563EB'
 
 VIP_SERVICE_KEYWORDS   = ['vip', 'elite']
 VIP_INSTRUCTION_PHRASES = ['timeslot', 'time slot', 'delivery required', 'required on site']
@@ -181,6 +292,8 @@ def parse_consignment_csvs(uploaded_files):
     frames = []
     for f in uploaded_files:
         try:
+            try: f.seek(0)
+            except Exception: pass
             frames.append(pd.read_csv(f, dtype=str))
         except Exception as e:
             st.warning(f"⚠ Could not read {f.name}: {e}")
@@ -1117,9 +1230,233 @@ def reconcile_csv(df_csv, recon_txt_df):
         })
     return pd.DataFrame(rows)
 
+# ════════════════════════════════════════════════════════════════════════════
+# TGE MAPPER HELPERS  (Tab 5)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Reads the line items out of TGE invoice PDFs and maps each invoice shipment to
+# the Machship consignment export, pulling on the Machship # and Reference 2 (the
+# W-number). Matching key: invoice "Customer Reference 1" → consignment
+# "Reference 1", with a Machship-# fallback (the customer often enters the
+# Machship number itself as their reference). Consignments that aren't on the
+# invoice are ignored. Invoice lines that can't be matched are left blank and
+# highlighted orange for manual review.
+
+# Invoice line-item columns, in the order they appear on the TGE PDF.
+INVOICE_COLUMNS = [
+    'Trading Account Number', 'Site Number', 'Date', 'Team GE Reference',
+    'Customer Reference 1', 'Product', 'Service', 'Origin', 'Destination',
+    'Qty', 'Cubic', 'Declared kg', 'Charged kg', 'Freight Charge', 'Fuel Charge',
+    'Other Charges', 'Total Charge Excl. GST', 'GST', 'Total Charge Incl. GST'
+]
+
+TGE_UNMATCHED_FILL = 'FFC000'   # orange for Excel unmatched rows
+
+
+def _norm_ref(s):
+    """Normalise a reference for matching: collapse whitespace, upper-case,
+    treat NaN/None as empty."""
+    if s is None:
+        return ''
+    txt = re.sub(r'\s+', ' ', str(s)).strip()
+    return '' if txt.lower() == 'nan' else txt.upper()
+
+
+def _ref_tokens(s):
+    """Split a (possibly multi-value) reference into individual tokens.
+    Handles separators like ',', '&', '/', and ' - '."""
+    raw = re.split(r'[,&/]|\s-\s|\s+', str(s if s is not None else ''))
+    return [_norm_ref(p) for p in raw if _norm_ref(p)]
+
+
+def _clean_cell(v):
+    """Clean a raw PDF/CSV cell → single-line trimmed string ('' for NaN/None)."""
+    if v is None:
+        return ''
+    s = re.sub(r'\s+', ' ', str(v)).strip()
+    return '' if s.lower() == 'nan' else s
+
+
+def parse_invoice_pdf(file_like, source_name=''):
+    """Extract line items from a TGE invoice PDF.
+
+    Returns (rows, invoice_number). Each row is a dict keyed by the invoice
+    column names plus 'Invoice #'. Uses pdfplumber's table extraction, locating
+    the 'Team GE Reference / Customer Reference 1' header on each page."""
+    import pdfplumber   # lazy import so the rest of the app runs without it
+    rows, invoice_no = [], None
+    try:
+        file_like.seek(0)
+    except Exception:
+        pass
+    with pdfplumber.open(file_like) as pdf:
+        for page in pdf.pages:
+            if invoice_no is None:
+                txt = page.extract_text() or ''
+                m = re.search(r'Invoice Number:?\s*([0-9]+)', txt)
+                if m:
+                    invoice_no = m.group(1)
+            for t in page.extract_tables():
+                if not t:
+                    continue
+                hdr_idx = None
+                for i, r in enumerate(t):
+                    joined = ' '.join(str(c) for c in r if c)
+                    if 'Team GE' in joined and 'Customer' in joined:
+                        hdr_idx = i
+                        break
+                if hdr_idx is None:
+                    continue
+                header = [_clean_cell(c) for c in t[hdr_idx]]
+                for r in t[hdr_idx + 1:]:
+                    d = {}
+                    for k in range(len(header)):
+                        key = header[k]
+                        if not key:
+                            continue
+                        d[key] = _clean_cell(r[k]) if k < len(r) else ''
+                    teamge  = d.get('Team GE Reference', '')
+                    tot     = d.get('Total Charge Incl. GST', '')
+                    custref = d.get('Customer Reference 1', '')
+                    joined  = ' '.join(v for v in d.values() if v)
+                    if not teamge and not tot and not custref:
+                        continue
+                    if joined.startswith('Sub Total') or 'Total Payable' in joined:
+                        continue
+                    d['Invoice #'] = invoice_no or source_name
+                    rows.append(d)
+    return rows, (invoice_no or source_name)
+
+
+def build_consignment_lookup(df_csv):
+    """Build lookups from the consignment export for matching invoice refs:
+    Reference 1 (exact) → rec, Reference 1 tokens → rec, Machship # (exact) → rec.
+    Each rec holds the Machship # and Reference 2 to copy onto the invoice line."""
+    ref_full, ref_tok, ms_full = {}, {}, {}
+    if df_csv is None or len(df_csv) == 0:
+        return ref_full, ref_tok, ms_full
+    r1col = 'Reference 1' if 'Reference 1' in df_csv.columns else None
+    r2col = 'Reference 2' if 'Reference 2' in df_csv.columns else None
+    mscol = 'Machship #'  if 'Machship #'  in df_csv.columns else None
+    for _, row in df_csv.iterrows():
+        rec = {'Machship #':  _clean_cell(row.get(mscol, '')) if mscol else '',
+               'Reference 2': _clean_cell(row.get(r2col, '')) if r2col else ''}
+        if r1col:
+            n = _norm_ref(row.get(r1col, ''))
+            if n and n not in ref_full:
+                ref_full[n] = rec
+            for tk in _ref_tokens(row.get(r1col, '')):
+                if len(tk) >= 4 and re.search(r'\d', tk) and tk not in ref_tok:
+                    ref_tok[tk] = rec
+        if mscol:
+            mn = _norm_ref(row.get(mscol, ''))
+            if mn and mn not in ms_full:
+                ms_full[mn] = rec
+    return ref_full, ref_tok, ms_full
+
+
+def map_invoice_row(custref, lookups):
+    """Resolve a single invoice 'Customer Reference 1' to a consignment record.
+    Priority: exact Reference 1 → partial Reference 1 token → Machship #.
+    Returns (rec_or_None, how)."""
+    ref_full, ref_tok, ms_full = lookups
+    n = _norm_ref(custref)
+    if not n:
+        return None, 'Unmatched'
+    if n in ref_full:
+        return ref_full[n], 'Reference 1'
+    for tk in _ref_tokens(custref):
+        if len(tk) >= 4 and re.search(r'\d', tk) and tk in ref_tok:
+            return ref_tok[tk], 'Reference 1 (partial)'
+    if n in ms_full:
+        return ms_full[n], 'Machship #'
+    return None, 'Unmatched'
+
+
+def build_tge_mapping(invoice_rows, df_csv):
+    """Map every invoice line to the consignment export, adding Machship #,
+    Reference 2, Matched On and a boolean _matched flag."""
+    lookups = build_consignment_lookup(df_csv)
+    out = []
+    for d in invoice_rows:
+        rec = dict(d)
+        m, how = map_invoice_row(d.get('Customer Reference 1', ''), lookups)
+        rec['Machship #']  = m['Machship #']  if m else ''
+        rec['Reference 2'] = m['Reference 2'] if m else ''
+        rec['Matched On']  = how
+        rec['_matched']    = m is not None
+        out.append(rec)
+    return pd.DataFrame(out)
+
+
+def tge_display_order(df):
+    """Column order for the mapped table: Customer Reference 1, then the two added
+    consignment columns (Machship #, Reference 2), then the remaining invoice
+    columns. Only keeps columns present; the 'Matched On' column is dropped."""
+    lead  = ['Customer Reference 1', 'Machship #', 'Reference 2']
+    rest  = ['Invoice #'] + [c for c in INVOICE_COLUMNS if c != 'Customer Reference 1']
+    order = lead + [c for c in rest if c not in lead]
+    return [c for c in order if c in df.columns]
+
+
+# Columns for the second, cut-down summary sheet.
+TGE_SUMMARY_COLUMNS = ['Customer Reference 1', 'Machship #', 'Reference 2', 'Team GE Reference']
+
+
+def build_tge_mapper_excel(df, order):
+    """Write the mapped invoice→consignment data to Excel with two sheets:
+      1) 'Invoice to Consignment' — every invoice column + Machship #/Reference 2.
+      2) 'Reference Summary' — only Customer Reference 1, Machship #, Reference 2
+         and Team GE Reference.
+    On both sheets, unmatched invoice rows (blank Machship #/Reference 2) are
+    highlighted orange."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    orange = PatternFill('solid', start_color=TGE_UNMATCHED_FILL)
+    hdr    = PatternFill('solid', start_color=HEADER_COLOR)
+
+    def _write_sheet(ws, cols, title):
+        cols = [c for c in cols if c in df.columns]
+        ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=13)
+        for c, col in enumerate(cols, 1):
+            cell = ws.cell(row=2, column=c, value=col)
+            cell.font = Font(bold=True, color='FFFFFF')
+            cell.fill = hdr
+        for r, (_, row) in enumerate(df.iterrows(), 3):
+            unmatched = not bool(row.get('_matched', True))
+            for c, col in enumerate(cols, 1):
+                cell = ws.cell(row=r, column=c, value=_clean_cell(row.get(col, '')))
+                if unmatched:
+                    cell.fill = orange
+        ws.freeze_panes = 'A3'
+        for c, col in enumerate(cols, 1):
+            try:
+                sample = [len(str(col))] + [len(str(v)) for v in df[col].astype(str).head(200)]
+                ws.column_dimensions[get_column_letter(c)].width = max(10, min(42, max(sample) + 2))
+            except Exception:
+                ws.column_dimensions[get_column_letter(c)].width = 16
+
+    _write_sheet(wb.create_sheet('Invoice to Consignment'),
+                 [c for c in order if c in df.columns],
+                 'Invoice lines mapped to Machship consignment export')
+    _write_sheet(wb.create_sheet('Reference Summary'),
+                 TGE_SUMMARY_COLUMNS,
+                 'Key references (Customer Ref 1 · Machship # · Reference 2 · Team GE Ref)')
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 RCTI Processor", "🔍 Invoice Reconciliation", "📸 Screenshot to Excel (Beta)", "🗂 Master Consolidation"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 RCTI Processor",
+    "🔍 Invoice Reconciliation",
+    "📸 Screenshot to Excel (Beta)",
+    "🗂 Master Consolidation",
+    "🗺️ TGE Mapper",
+])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1
@@ -1426,13 +1763,13 @@ with tab2:
             for i in range(len(df)):
                 status = df.iloc[i]['Status']
                 if status == '❌ Mismatch':
-                    styles.iloc[i, :] = 'background-color: #4a1a1a; color: #ffb3b3'
+                    styles.iloc[i, :] = 'background-color: #fde2e2; color: #8a1f1f'
                 elif status == '🔍 Manual review':
-                    styles.iloc[i, :] = 'background-color: #3a3320; color: #e0d4a8'
+                    styles.iloc[i, :] = 'background-color: #fff3cd; color: #7a5b00'
                 elif status == '⚠ No FSC for date':
-                    styles.iloc[i, :] = 'background-color: #3a2e1a; color: #e8c98a'
+                    styles.iloc[i, :] = 'background-color: #ffe8c2; color: #7c4a00'
                 elif status == '✓ OK':
-                    styles.iloc[i, :] = 'background-color: #14241a; color: #a8d4b4'
+                    styles.iloc[i, :] = 'background-color: #dcf5e3; color: #1f6b3a'
             return styles
 
         st.dataframe(recon_df[display_cols].style.apply(style_recon, axis=None),
@@ -1455,11 +1792,11 @@ with tab2:
                 for i in range(len(df)):
                     s = df.iloc[i]['Status']
                     if s == '❌ Mismatch':
-                        styles.iloc[i, :] = 'background-color: #4a1a1a; color: #ffb3b3'
+                        styles.iloc[i, :] = 'background-color: #fde2e2; color: #8a1f1f'
                     elif s == '🔍 Manual review':
-                        styles.iloc[i, :] = 'background-color: #3a3320; color: #e0d4a8'
+                        styles.iloc[i, :] = 'background-color: #fff3cd; color: #7a5b00'
                     elif s == '✓ OK':
-                        styles.iloc[i, :] = 'background-color: #14241a; color: #a8d4b4'
+                        styles.iloc[i, :] = 'background-color: #dcf5e3; color: #1f6b3a'
                 return styles
 
             st.dataframe(csv_recon_df.style.apply(style_csv, axis=None),
@@ -1473,7 +1810,7 @@ with tab2:
             red  = PatternFill('solid', start_color='C00000')
             grn  = PatternFill('solid', start_color='1F7A1F')
             yel  = PatternFill('solid', start_color='B8860B')
-            hdrf = PatternFill('solid', start_color='1F4E79')
+            hdrf = PatternFill('solid', start_color=HEADER_COLOR)
 
             def write_df(ws, df, title):
                 ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=13)
@@ -1841,3 +2178,119 @@ with tab4:
                 data=xbuf, file_name="master_consolidated.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.caption("Summary, raw_data, per-state, consolidated_by_1800, discrepancies, state_vs_machship.")
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 5 — TGE Mapper
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab5:
+    st.write(
+        "Upload one or more **TGE invoice PDFs** and the **Machship consignment export (.CSV)**. "
+        "Each invoice shipment is mapped to the consignment export so the **Machship #** and "
+        "**Reference 2 (the W-number)** get pulled onto every invoice line."
+    )
+    st.caption(
+        "Matching key: invoice **Customer Reference 1** → consignment **Reference 1** "
+        "(with a **Machship #** fallback, since the reference entered is often the Machship number itself). "
+        "Consignments that are on the export but not on the invoice are ignored."
+    )
+
+    mcol1, mcol2 = st.columns(2)
+    with mcol1:
+        tge_invoices = st.file_uploader(
+            "① Invoice PDFs (e.g. 1269984.pdf, 1272416.pdf)",
+            type=['pdf', 'PDF'], key="tab5_invoices", accept_multiple_files=True)
+    with mcol2:
+        tge_csvs = st.file_uploader(
+            "② Machship consignment export (.CSV)",
+            type=['csv', 'CSV'], key="tab5_csvs", accept_multiple_files=True)
+
+    if tge_invoices and tge_csvs:
+        # Make sure pdfplumber is available before doing anything.
+        try:
+            import pdfplumber  # noqa: F401
+            _has_pdf = True
+        except Exception:
+            _has_pdf = False
+
+        if not _has_pdf:
+            st.error("This tab needs the **pdfplumber** package to read invoice PDFs. "
+                     "Install it with `pip install pdfplumber` and reload.")
+        else:
+            oversize = [f.name for f in tge_invoices if f.size > 20 * 1024 * 1024]
+            if oversize:
+                st.error(f"⚠ These PDFs exceed the 20MB limit: {', '.join(oversize)}")
+                st.stop()
+
+            with st.spinner("Reading invoices and matching against the consignment export..."):
+                invoice_rows, parse_errors = [], []
+                for f in tge_invoices:
+                    try:
+                        rows, _inv = parse_invoice_pdf(f, getattr(f, 'name', 'invoice.pdf'))
+                        invoice_rows += rows
+                    except Exception as e:
+                        parse_errors.append(f"{getattr(f, 'name', 'a PDF')}: {e}")
+                df_csv = parse_consignment_csvs(tge_csvs)
+                df_map = build_tge_mapping(invoice_rows, df_csv) if invoice_rows else pd.DataFrame()
+
+            for err in parse_errors:
+                st.warning(f"⚠ Could not read {err}")
+
+            if df_map.empty:
+                st.error("No invoice line items could be read from the uploaded PDF(s). "
+                         "Make sure these are the TGE 'Intermodal & Specialised' invoices.")
+            else:
+                total     = len(df_map)
+                matched   = int(df_map['_matched'].sum())
+                unmatched = total - matched
+
+                # ── First line: were all invoice lines found? ──────────────
+                if unmatched == 0:
+                    st.success(f"✅ All {total} invoice line(s) were matched to the consignment export.")
+                else:
+                    st.warning(
+                        f"⚠️ {matched} of {total} invoice line(s) matched — "
+                        f"**{unmatched} could not be matched** and are highlighted orange below "
+                        "so you can double-check where these shipments are."
+                    )
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Invoice lines", total)
+                m2.metric("Matched", matched)
+                m3.metric("Unmatched", unmatched)
+
+                order   = tge_display_order(df_map)
+                show_df = df_map[order].copy()
+                unmatched_mask = (~df_map['_matched']).tolist()
+
+                # ── Mapped table (unmatched rows highlighted orange) ───────
+                st.divider()
+                st.subheader("Invoice lines → consignment export")
+                st.caption("Added columns **Machship #** and **Reference 2** come from the consignment export. "
+                           "Orange rows couldn't be matched and have blank added cells.")
+
+                def _highlight_unmatched(_):
+                    styles = pd.DataFrame('', index=show_df.index, columns=show_df.columns)
+                    for i in range(len(show_df)):
+                        if unmatched_mask[i]:
+                            styles.iloc[i, :] = 'background-color: #ffe3c2; color: #7c3a00'
+                    return styles
+
+                st.dataframe(show_df.style.apply(_highlight_unmatched, axis=None),
+                             use_container_width=True, hide_index=True)
+
+                if unmatched:
+                    with st.expander(f"Show only the {unmatched} unmatched line(s)"):
+                        st.dataframe(show_df[unmatched_mask], use_container_width=True, hide_index=True)
+
+                # ── Download Excel ─────────────────────────────────────────
+                st.divider()
+                xbuf = build_tge_mapper_excel(df_map, order)
+                st.download_button(
+                    "⬇️ Download mapped Excel",
+                    data=xbuf, file_name="tge_mapped.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.caption("One sheet: every invoice line with Machship # and Reference 2 added; "
+                           "unmatched rows filled orange.")
+    else:
+        st.info("Upload at least one invoice PDF and one consignment CSV to run the mapping.")
