@@ -5,6 +5,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 import io
 import re
+import codecs
 from datetime import datetime
 from collections import Counter
 
@@ -163,6 +164,42 @@ VIP_INSTRUCTION_PHRASES = ['timeslot', 'time slot', 'delivery required', 'requir
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
+def _to_text_buffer(uploaded_file):
+    """Decode an uploaded file to text, tolerating non-UTF-8 exports.
+
+    Carrier statement .TXT and consignment .CSV files are frequently written as
+    cp1252 ("ANSI") or UTF-16 rather than UTF-8, which makes pd.read_csv raise
+    UnicodeDecodeError while reading the header row. Returns a StringIO that
+    pandas can read. latin-1 is the last resort and can decode any byte, so this
+    never raises.
+    """
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    raw = uploaded_file.read()
+    if isinstance(raw, str):
+        return io.StringIO(raw)
+
+    if raw.startswith(codecs.BOM_UTF8):
+        text = raw[len(codecs.BOM_UTF8):].decode('utf-8')
+    elif raw.startswith(codecs.BOM_UTF16_LE) or raw.startswith(codecs.BOM_UTF16_BE):
+        text = raw.decode('utf-16')
+    elif raw[:200].count(b'\x00') > 20:            # UTF-16 written without a BOM
+        text = raw.decode('utf-16-le', errors='replace')
+    else:
+        text = None
+        for enc in ('utf-8', 'cp1252', 'latin-1'):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:                           # belt and braces
+            text = raw.decode('latin-1', errors='replace')
+    return io.StringIO(text)
+
+
 def clean_number(val):
     if pd.isna(val):
         return 0.0
@@ -277,7 +314,7 @@ def is_vip_instruction(instr_val):
     return any(phrase in s for phrase in VIP_INSTRUCTION_PHRASES)
 
 def parse_txt(uploaded_file):
-    df_raw = pd.read_csv(uploaded_file, sep='\t', dtype=str)
+    df_raw = pd.read_csv(_to_text_buffer(uploaded_file), sep='\t', dtype=str)
     summary_row_data = df_raw.iloc[-1]
     df = df_raw[:-1].copy()
     for col in ['Total (AUD)', 'GST (AUD)', 'Freight', 'LEVY', 'Load Qty', 'Paid Qty']:
@@ -292,11 +329,9 @@ def parse_consignment_csvs(uploaded_files):
     frames = []
     for f in uploaded_files:
         try:
-            try: f.seek(0)
-            except Exception: pass
-            frames.append(pd.read_csv(f, dtype=str))
+            frames.append(pd.read_csv(_to_text_buffer(f), dtype=str))
         except Exception as e:
-            st.warning(f"⚠ Could not read {f.name}: {e}")
+            st.warning(f"⚠ Could not read {getattr(f, 'name', 'a .CSV')}: {e}")
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -359,7 +394,7 @@ def enrich_txt_with_csv(df_txt, df_csv):
     return df_out
 
 def parse_csv(uploaded_file):
-    df = pd.read_csv(uploaded_file, dtype=str)
+    df = pd.read_csv(_to_text_buffer(uploaded_file), dtype=str)
     for col in ['Quantity', 'Total Cubic', 'Rate Charge', 'Fuel Levy',
                 'Rate Charge and Fuel Levy', 'Total Tax', 'Total']:
         df[col] = df[col].apply(clean_number)
@@ -672,9 +707,7 @@ def parse_multiple_txt(uploaded_files):
     frames, total, info = [], 0.0, []
     for f in uploaded_files:
         try:
-            try: f.seek(0)          # Streamlit re-runs the script; reset the pointer
-            except Exception: pass
-            df, ct = parse_txt(f)
+            df, ct = parse_txt(f)     # parse_txt seeks to 0 via _to_text_buffer
             frames.append(df.copy())
             total += ct
             info.append({'File': getattr(f, 'name', 'uploaded.txt'),
@@ -871,7 +904,8 @@ def build_master_txt(df):
     """Serialise the combined client data back to a tab-separated master_file.txt
     (original .TXT columns + a trailing summary row) so it re-uploads cleanly and
     keeps growing next time. The summary row's Total (AUD) holds the INC-GST grand
-    total, matching the source statements (that's the figure parse_txt reads)."""
+    total, matching the source statements (that's the figure parse_txt reads).
+    Written as UTF-8; _to_text_buffer reads it back regardless of encoding."""
     out = df.reindex(columns=TXT_COLUMNS).copy()
     ex_gst  = pd.to_numeric(out['Total (AUD)'], errors='coerce').fillna(0).sum()
     gst     = pd.to_numeric(out['GST (AUD)'],   errors='coerce').fillna(0).sum()
@@ -2074,9 +2108,6 @@ with tab4:
         ref_col = sell_col = None
         df_csv = pd.DataFrame()
         if master_csvs:
-            for f in master_csvs:
-                try: f.seek(0)
-                except Exception: pass
             df_csv = parse_consignment_csvs(master_csvs)
             if not df_csv.empty:
                 st.divider()
