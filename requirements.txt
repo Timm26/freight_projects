@@ -4,3 +4,6 @@ openpyxl==3.1.5
 pdfplumber
 pytesseract==0.3.13
 pillow==12.2.0
+requests==2.33.1
+beautifulsoup4==4.14.3
+lxml==6.0.2
