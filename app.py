@@ -1484,13 +1484,25 @@ def build_tge_mapper_excel(df, order):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+from fuel_levy_tab import admin_login_box, fuel_unlocked, render_fuel_levy_tab
+
+admin_login_box()
+
+_tab_names = [
     "📊 RCTI Processor",
     "🔍 Invoice Reconciliation",
     "📸 Screenshot to Excel (Beta)",
     "🗂 Master Consolidation",
     "🗺️ TGE Mapper",
-])
+]
+if fuel_unlocked():
+    _tab_names.append("⛽ Fuel Levy")
+_tabs = st.tabs(_tab_names)
+tab1, tab2, tab3, tab4, tab5 = _tabs[:5]
+
+if fuel_unlocked():
+    with _tabs[5]:
+        render_fuel_levy_tab()
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1
